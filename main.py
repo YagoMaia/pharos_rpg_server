@@ -3,65 +3,22 @@ import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from connection import manager
-from models import ActionType, Character, CombatState, EntityType, PlayerAction
+from game_server import GameLogic
 
 app = FastAPI()
+game_logic = GameLogic(manager)
 
 
 @app.websocket("/ws/{session_id}/{character_id}")
-async def combat_endpoint(websocket: WebSocket, session_id: str, character_id: str):
+async def combat_endpoint(websocket: WebSocket, session_id: str):
     await manager.connect(session_id, websocket)
-
     try:
-        # Envia estado inicial ao conectar
-        current_state = await manager.get_state(session_id)
-        if current_state:
-            await websocket.send_text(current_state.model_dump_json())
-
         while True:
-            data = await websocket.receive_text()
-            action_data = json.loads(data)
-            action = PlayerAction(**action_data)
+            data_text = await websocket.receive_text()
+            data_json = json.loads(data_text)
 
-            # Recuperar estado atual do Redis (Single Source of Truth)
-            state = await manager.get_state(session_id)
-            if not state:
-                continue
-
-            # --- Validação de Regras de Negócio ---
-
-            # 1. É a vez de quem enviou a mensagem?
-            current_actor_id = state.turn_order[state.turn_index]
-            if current_actor_id != character_id:
-                await websocket.send_json({"error": "Não é seu turno!"})
-                continue
-
-            # --- Processamento da Ação ---
-
-            if action.action == ActionType.ATTACK:
-                if not action.target_id or not action.damage_amount:
-                    return
-                target = state.entities.get(action.target_id)
-                if target:
-                    target.hp -= action.damage_amount
-                    state.logs.append(
-                        f"{state.entities[character_id].name} atacou {target.name} causando {action.damage_amount} de dano."
-                    )
-
-                    # Verifica Morte
-                    if target.hp <= 0:
-                        target.hp = 0
-                        state.logs.append(f"{target.name} caiu inconsciente!")
-
-            elif action.action == ActionType.END_TURN:
-                # Avança o turno
-                state.turn_index = (state.turn_index + 1) % len(state.turn_order)
-                next_actor = state.entities[state.turn_order[state.turn_index]]
-                state.logs.append(f"Fim de turno. Vez de {next_actor.name}.")
-
-            # --- Publicação ---
-            # Salva no Redis e avisa todos (Players e Mestre)
-            await manager.broadcast_state(session_id, state)
+            # Delega tudo para a classe de lógica
+            await game_logic.handle_message(session_id, data_json)
 
     except WebSocketDisconnect:
         manager.disconnect(session_id, websocket)
