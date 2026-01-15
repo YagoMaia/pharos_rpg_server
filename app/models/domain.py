@@ -93,3 +93,11 @@ class CombatSession(BaseModel):
     # Mapa de ID -> Combatant
     combatants: Dict[str, Combatant]
     logs: List[str] = []
+
+# class CombatState(BaseModel):
+#     session_id: str
+#     turn_index: int = 0  # Índice do array de turn_order
+#     turn_order: List[str]  # Lista de IDs dos personagens ordenados
+#     entities: dict[str, Character]  # Mapa de ID -> Personagem
+#     active: bool = True
+#     logs: List[str] = []

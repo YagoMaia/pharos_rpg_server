@@ -1,16 +1,16 @@
 import asyncio
 from typing import Optional
 
+from core.config import settings
 from fastapi import WebSocket
 from redis import asyncio as aioredis
 
-from models import CombatState
+from models.domain import CombatSession
 
 
 class ConnectionManager:
     def __init__(self):
-        # Redis connection URL (use variáveis de ambiente em prod)
-        self.redis = aioredis.from_url("redis://localhost:6379", decode_responses=True)
+        self.redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
         self.active_connections: dict[str, list[WebSocket]] = {}
 
     async def connect(self, session_id: str, websocket: WebSocket):
@@ -40,18 +40,18 @@ class ConnectionManager:
                     for connection in self.active_connections[session_id]:
                         await connection.send_text(data)
 
-    async def broadcast_state(self, session_id: str, state: CombatState):
+    async def broadcast_state(self, session_id: str, state: CombatSession):
         """Salva o estado e publica no Redis"""
         # 1. Persistir o estado (TTL de 1 hora para não lixar memória)
         await self.redis.set(f"state:{session_id}", state.model_dump_json(), ex=3600)
 
         # 2. Publicar evento
-        await self.redis.publish(f"channel:{session_id}", state.json())
+        await self.redis.publish(f"channel:{session_id}", state.model_dump_json())
 
-    async def get_state(self, session_id: str) -> Optional[CombatState]:
+    async def get_state(self, session_id: str) -> Optional[CombatSession]:
         data = await self.redis.get(f"state:{session_id}")
         if data:
-            return CombatState.model_validate_json(data)
+            return CombatSession.model_validate_json(data)
         return None
 
 
