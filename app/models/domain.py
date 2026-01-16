@@ -59,7 +59,7 @@ class Stance(BaseModel):
 class Combatant(BaseModel):
     id: str
     name: str
-    baseName: str
+    baseName: Optional[str] = None
     initiative: int
     hp: StatsPair
     type: Literal["player", "npc"]
@@ -93,6 +93,7 @@ class CombatSession(BaseModel):
     # Mapa de ID -> Combatant
     combatants: Dict[str, Combatant]
     logs: List[str] = []
+
 
 # class CombatState(BaseModel):
 #     session_id: str

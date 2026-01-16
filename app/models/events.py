@@ -35,14 +35,14 @@ class RemoveCombatantPayload(BaseModel):
 
 class ResolveActionPayload(BaseModel):
     attackerId: str
-    targetId: Optional[str] = None  # Pode ser None (ex: buff em si mesmo ou área)
+    targetId: Optional[str] = None  # Pode ser null (ex: buff em si mesmo)
 
-    actionName: str  # Nome para o Log (ex: "Bola de Fogo", "Espada Longa")
+    actionName: str  # Ex: "Espada Longa", "Bola de Fogo", "Cura"
 
-    # Custos
+    # CUSTOS
     costType: ActionCostType = "standard"
-    focusCost: int = 0
+    focusCost: int = 0  # 0 para ataques básicos, >0 para skills
 
-    # Efeitos (Simplificados)
-    damageAmount: int = 0  # Se > 0, reduz HP
-    healingAmount: int = 0  # Se > 0, aumenta HP
+    # EFEITOS (Calculados no frontend)
+    damageAmount: int = 0
+    healingAmount: int = 0

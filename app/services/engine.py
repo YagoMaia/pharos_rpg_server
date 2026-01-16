@@ -24,64 +24,106 @@ class GameLogic:
 
         # Se não existe estado e o evento não é JOIN ou CREATE, erro
         if not state:
-            if event_type == "JOIN_SESSION":
-                # A sessão não existe, mas é um pedido de entrada? CRIAMOS AGORA.
-                state = self._create_session(session_id)
-            else:
-                # Sessão não existe e tentaram atacar/mover? Ignora ou erro.
-                # (Opcional: enviar msg de erro via socket informando que a sessão expirou)
-                return
+            if not state:
+                # Se for Jogador entrando OU Mestre conectando, criamos a sessão
+                if event_type in ["JOIN_SESSION", "GM_CONNECT"]:
+                    state = self._create_session(session_id)
+                    print(f"Sessão {session_id} criada por {event_type}")
+                else:
+                    return
 
         if not payload:
             return
 
         # --- Roteamento de Eventos ---
 
-        if event_type == "JOIN_SESSION":
+        if event_type == "GM_CONNECT":
+            await self._handle_gm_connect(state)
+
+        elif event_type == "GM_UPDATE_COMBATANT":
+            await self._handle_gm_update_combatant(state, payload)
+
+        elif event_type == "GM_ADD_NPC":
+            await self._handle_add_npc(state, payload)
+
+        elif event_type == "GM_REMOVE_COMBATANT":
+            await self._handle_remove_combatant(state, payload)
+
+        elif event_type == "JOIN_SESSION":
             await self._handle_join_session(state, payload)
 
-        if event_type == "MANUAL_UPDATE":
+        elif event_type == "MANUAL_UPDATE":
             await self._handle_update_hp(state, payload)
 
         elif event_type == "CHANGE_STANCE":
             await self._handle_change_stance(state, payload)
 
-        elif event_type == "NEXT_TURN":
+        elif event_type == "END_TURN":
             await self._handle_next_turn(state)
 
         elif event_type == "RESOLVE_ACTION":
             await self._handle_use_skill(state, payload)
 
-        elif event_type == "REMOVE_COMBATANT":
-            await self._handle_remove_combatant(state, payload)
-
         # Salva e notifica a todos
-        if state:
+        if state and state.session_id:
             await self.manager.broadcast_state(session_id, state)
 
     # --- Implementação das Regras ---
 
-    async def _handle_join_session(self, state: CombatSession, payload: dict):
-        # Payload esperado: { combatant: { ...dados... } }
-        combatant_data = payload.get("combatant")
+    async def _handle_gm_connect(self, state: CombatSession):
+        # Não adiciona na lista de combatentes, apenas loga
+        state.logs.append("O Mestre (GM) conectou na sala.")
 
-        # Validação e Conversão Pydantic
-        # Isso garante que o dict vire um objeto Combatant com métodos e tipos certos
+    async def _handle_join_session(self, state: CombatSession, payload: dict):
+        combatant_data = payload.get("combatant")
         new_combatant = Combatant(**combatant_data)
 
-        # Lógica de Idempotência: Se já existe, atualiza ou ignora?
-        # Aqui vou assumir que substitui (reconexão)
+        # 1. VERIFICAÇÃO SEGURA: Checa se o ID já está nas chaves do dicionário
+        if new_combatant.id in state.combatants:
+            # --- CENÁRIO: RECONEXÃO ---
+            # O jogador já existe no Redis. NÃO sobrescrevemos.
+            # Isso garante que se ele der F5, não volta com HP cheio nem reseta as ações.
+            state.logs.append(f"{new_combatant.name} reconectou à sessão.")
+
+            # (Opcional) Se quiser atualizar dados cosméticos (ex: nome mudou), faça aqui:
+            # state.combatants[new_combatant.id].name = new_combatant.name
+            return  # Sai da função para não executar a lógica de novo jogador
+
+        # --- CENÁRIO: NOVO JOGADOR ---
+        # Adiciona ao dicionário
         state.combatants[new_combatant.id] = new_combatant
 
-        # Adiciona à ordem de turnos se não estiver lá
+        # Adiciona à ordem de turnos
         if new_combatant.id not in state.turn_order:
             state.turn_order.append(new_combatant.id)
-            # Reordena por iniciativa (maior para menor)
+            # Reordena por iniciativa
             state.turn_order.sort(
                 key=lambda x: state.combatants[x].initiative, reverse=True
             )
 
         state.logs.append(f"{new_combatant.name} entrou no combate.")
+
+    async def _handle_add_npc(self, state: CombatSession, payload: dict):
+        """
+        Adiciona um NPC ao combate.
+        Diferente do Player, o NPC entra direto via comando do Mestre.
+        """
+        # O payload já deve vir com o objeto Combatant pronto (montado no Front)
+        combatant_data = payload
+        new_npc = Combatant(**combatant_data)
+
+        # Adiciona ao mapa de combatentes
+        state.combatants[new_npc.id] = new_npc
+
+        # Adiciona à ordem de iniciativa
+        state.turn_order.append(new_npc.id)
+
+        # Reordena (Iniciativa maior -> menor)
+        state.turn_order.sort(
+            key=lambda x: state.combatants[x].initiative, reverse=True
+        )
+
+        state.logs.append(f"(GM) Adicionou inimigo: {new_npc.name}")
 
     async def _handle_remove_combatant(self, state: CombatSession, payload: dict):
         """
@@ -125,27 +167,19 @@ class GameLogic:
         state.logs.append(f"{name} foi removido do combate.")
 
     async def _handle_resolve_action(self, state: CombatSession, payload: dict):
-        """
-        Centraliza a lógica de executar uma ação:
-        1. Verifica economia de ações (tem Ação Padrão?)
-        2. Verifica recursos (tem Foco?)
-        3. Consome os custos
-        4. Aplica o efeito (Dano/Cura)
-        """
         data = ResolveActionPayload(**payload)
 
         attacker = state.combatants.get(data.attackerId)
         if not attacker:
-            return  # Ou logar erro
+            return
 
-        # --- PASSO 1: Validação e Consumo de Ações (Action Economy) ---
-
-        # Só validamos se não for custo livre/none
+        # --- 1. VERIFICAÇÃO DE ECONOMIA DE AÇÕES (Action Economy) ---
+        # Se for um ataque básico ou skill, consome a ação padrão/bônus
         if data.costType == "standard":
             if not attacker.turnActions.standard:
-                # Opcional: Enviar erro específico para o usuário
+                # Opcional: Logar tentativa falha
                 return
-            attacker.turnActions.standard = False  # Gasta a ação
+            attacker.turnActions.standard = False  # GASTOU A AÇÃO
 
         elif data.costType == "bonus":
             if not attacker.turnActions.bonus:
@@ -157,56 +191,84 @@ class GameLogic:
                 return
             attacker.turnActions.reaction = False
 
-        # --- PASSO 2: Validação e Consumo de Foco ---
-
+        # --- 2. VERIFICAÇÃO DE RECURSOS (FOCO) ---
+        # Se for Ataque Básico, focusCost será 0, então passa direto
         if data.focusCost > 0:
             if attacker.currentFocus < data.focusCost:
-                # Sem foco suficiente, cancela ação (e devolve o slot de ação gasto acima?)
-                # Para simplificar, assumimos que o Front bloqueia, mas aqui devolvemos a ação:
+                state.logs.append(
+                    f"{attacker.name} tentou usar {data.actionName} sem Foco suficiente."
+                )
+                # Devolve a ação que foi gasta no passo 1 (Rollback simples)
                 if data.costType == "standard":
                     attacker.turnActions.standard = True
-                if data.costType == "bonus":
-                    attacker.turnActions.bonus = True
-                state.logs.append(
-                    f"{attacker.name} tentou usar {data.actionName} mas não tem foco suficiente."
-                )
                 return
 
             attacker.currentFocus -= data.focusCost
 
-        # --- PASSO 3: Aplicação de Efeitos (Dano/Cura) ---
-
+        # --- 3. APLICAÇÃO DE EFEITOS (DANO/CURA) ---
         target = state.combatants.get(data.targetId) if data.targetId else None
-        effect_msg = ""
+        log_detail = ""
 
         if target:
-            # Aplica Dano
+            # Lógica de Dano
             if data.damageAmount > 0:
                 old_hp = target.hp.current
                 target.hp.current = max(0, target.hp.current - data.damageAmount)
-                real_dmg = old_hp - target.hp.current
-                effect_msg = f"causando {real_dmg} de dano em {target.name}"
+                damage_done = old_hp - target.hp.current
+                log_detail = f"causando {damage_done} de dano em {target.name}"
 
                 if target.hp.current == 0:
-                    effect_msg += " (CAIU!)"
+                    log_detail += " (CAIU!)"
 
-            # Aplica Cura
+            # Lógica de Cura
             elif data.healingAmount > 0:
                 old_hp = target.hp.current
                 target.hp.current = min(
                     target.hp.max, target.hp.current + data.healingAmount
                 )
-                real_heal = target.hp.current - old_hp
-                effect_msg = f"curando {real_heal} PV de {target.name}"
-        else:
-            # Se não tem alvo (ex: Buff em si mesmo ou Errou ataque), mensagem genérica
-            effect_msg = ""
+                healed = target.hp.current - old_hp
+                log_detail = f"curando {healed} PV de {target.name}"
 
-        # --- PASSO 4: Log Final ---
-        cost_txt = f"[{data.costType}]" if data.costType != "none" else ""
-        state.logs.append(
-            f"{attacker.name} usou {data.actionName} {cost_txt} {effect_msg}."
-        )
+            else:
+                log_detail = f"em {target.name} (sem dano)"
+        else:
+            log_detail = "(efeito sem alvo)"
+
+        # --- 4. LOG FINAL ---
+        state.logs.append(f"{attacker.name} usou {data.actionName} {log_detail}.")
+
+    async def _handle_gm_update_combatant(self, state: CombatSession, payload: dict):
+        target_id = payload["combatantId"]
+        value = payload["value"]
+        field = payload["field"]
+
+        combatant = state.combatants.get(target_id)
+
+        if combatant:
+            if field == "hp_current":
+                diff = combatant.hp.current - value
+                combatant.hp.current = value
+
+                # Log simples
+                action_text = "curou" if diff < 0 else "deu dano"
+                state.logs.append(
+                    f"Mestre {action_text} {combatant.name} - {abs(diff)} PV."
+                )
+
+                if combatant.hp.current == 0:
+                    state.logs.append(f"{combatant.name} caiu!")
+            elif field == "current_focus":
+                diff = combatant.currentFocus - value
+                combatant.currentFocus = value
+
+                # Log simples
+                action_text = "recuperou" if diff < 0 else "gastou"
+                state.logs.append(
+                    f"Mestre {action_text} {combatant.name} - {abs(diff)} Foco."
+                )
+
+                if combatant.currentFocus == 0:
+                    state.logs.append(f"{combatant.name} sem foco!")
 
     async def _handle_update_hp(self, state: CombatSession, payload: dict):
         target_id = payload["combatantId"]
@@ -232,12 +294,22 @@ class GameLogic:
         combatant = state.combatants.get(c_id)
         if combatant:
             # Busca o nome da postura para o log
+
+            if s_id is None:
+                state.logs.append(
+                    f"{combatant.name} assumiu a postura Neutra (CA {new_ac})."
+                )
+                combatant.activeStanceId = None
+                combatant.armorClass = new_ac
+                return
+
             stance_name = next(
                 (s.name for s in combatant.stances if s.id == s_id), "Desconhecida"
             )
 
             combatant.activeStanceId = s_id
             combatant.armorClass = new_ac
+            combatant.turnActions.bonus = False
             state.logs.append(
                 f"{combatant.name} assumiu a postura {stance_name} (CA {new_ac})."
             )
@@ -264,6 +336,12 @@ class GameLogic:
         next_actor = state.combatants.get(next_id)
 
         if next_actor:
+            if next_actor.hp.current <= 0 and next_actor.type == "npc":
+                state.logs.append(f"{next_actor.name} Morto")
+                await self._handle_remove_combatant(
+                    state, {"combatantId": next_actor.id}
+                )
+                return
             # REGRA DE OURO: Resetar economia de ações no INÍCIO do turno
             next_actor.turnActions.standard = True
             next_actor.turnActions.bonus = True
@@ -294,7 +372,9 @@ class GameLogic:
             elif cost_type == "Ação Bônus" and combatant.turnActions.bonus:
                 combatant.turnActions.bonus = False
                 can_act = True
-            # ... outros tipos
+            elif cost_type == "Reação" and combatant.turnActions.reaction:
+                combatant.turnActions.reaction = False
+                can_act = True
 
             if can_act:
                 # Gasta Foco
