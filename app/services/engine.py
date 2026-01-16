@@ -80,14 +80,29 @@ class GameLogic:
 
         # 1. VERIFICAÇÃO SEGURA: Checa se o ID já está nas chaves do dicionário
         if new_combatant.id in state.combatants:
-            # --- CENÁRIO: RECONEXÃO ---
-            # O jogador já existe no Redis. NÃO sobrescrevemos.
-            # Isso garante que se ele der F5, não volta com HP cheio nem reseta as ações.
-            state.logs.append(f"{new_combatant.name} reconectou à sessão.")
+            # Recupera a versão que está salva no Redis (O estado da batalha)
+            existing = state.combatants[new_combatant.id]
 
-            # (Opcional) Se quiser atualizar dados cosméticos (ex: nome mudou), faça aqui:
-            # state.combatants[new_combatant.id].name = new_combatant.name
-            return  # Sai da função para não executar a lógica de novo jogador
+            # --- LÓGICA DE MERGE (ATUALIZAÇÃO SEGURA) ---
+
+            # Atualiza STATUS (Permite que ele volte curado/descansado)
+            existing.hp = new_combatant.hp
+            existing.currentFocus = new_combatant.currentFocus
+            existing.maxFocus = new_combatant.maxFocus
+
+            # Atualiza FICHA (Caso tenha trocado de arma ou upado de nível)
+            existing.attributes = new_combatant.attributes
+            existing.equipment = new_combatant.equipment
+            existing.skills = new_combatant.skills
+            existing.armorClass = new_combatant.armorClass
+
+            # --- O QUE NÃO ATUALIZAMOS (PROTEÇÃO) ---
+            # existing.initiative      -> Mantém o lugar na fila
+            # existing.turnActions     -> Impede "roubar" ações saindo e voltando
+            # existing.activeStanceId  -> Mantém a postura ativa
+
+            state.logs.append(f"{new_combatant.name} retornou (Status Sincronizados).")
+            return
 
         # --- CENÁRIO: NOVO JOGADOR ---
         # Adiciona ao dicionário
@@ -171,6 +186,17 @@ class GameLogic:
 
         attacker = state.combatants.get(data.attackerId)
         if not attacker:
+            return
+
+        # --- 0. VALIDAÇÃO DE TURNO (A MUDANÇA ESTÁ AQUI) ---
+
+        # Quem é o dono do turno atual?
+        current_turn_id = state.turn_order[state.turn_index]
+
+        # Se NÃO é o turno do atacante E NÃO é uma reação, bloqueia.
+        if attacker.id != current_turn_id and data.costType != "reaction":
+            # (Opcional) Enviar erro para o usuário via socket individual
+            print(f"Bloqueado: {attacker.name} tentou agir fora do turno.")
             return
 
         # --- 1. VERIFICAÇÃO DE ECONOMIA DE AÇÕES (Action Economy) ---
