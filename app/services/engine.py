@@ -62,7 +62,7 @@ class GameLogic:
             await self._handle_next_turn(state)
 
         elif event_type == "RESOLVE_ACTION":
-            await self._handle_use_skill(state, payload)
+            await self._handle_resolve_action(state, payload)
 
         # Salva e notifica a todos
         if state and state.session_id:
