@@ -53,7 +53,19 @@ class Stance(BaseModel):
     acBonus: Optional[int] = 0
 
 
-# --- Entidade Principal de Combate ---
+class Spell(BaseModel):
+    id: str
+    name: str
+    school: str = "Universal"
+    circle: int = 1
+    description: str = ""
+    effect: str = ""
+    cost: int = 0
+
+    # Campos de Automação de Combate
+    isAttack: bool = False
+    damageFormula: Optional[str] = None  # Ex: "1d10"
+    actionType: str = "standard"  # "standard", "bonus", "reaction"
 
 
 class Combatant(BaseModel):
@@ -76,6 +88,7 @@ class Combatant(BaseModel):
 
     stances: List[Stance] = []
     skills: List[Skill] = []
+    spells: List[Spell] = []
 
     activeStanceId: Optional[str] = None
 

@@ -95,6 +95,7 @@ class GameLogic:
             existing.equipment = new_combatant.equipment
             existing.skills = new_combatant.skills
             existing.armorClass = new_combatant.armorClass
+            existing.spells = new_combatant.spells
 
             # --- O QUE NÃO ATUALIZAMOS (PROTEÇÃO) ---
             # existing.initiative      -> Mantém o lugar na fila

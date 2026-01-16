@@ -1,7 +1,7 @@
 [project]
 name = "pharos-rpg-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "Backend server for a real-time RPG, built with FastAPI and WebSockets."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

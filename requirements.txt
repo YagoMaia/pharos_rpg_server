@@ -1,0 +1,4 @@
+aioredis>=2.0.1
+fastapi[standard]>=0.128.0
+redis>=7.1.0
+websockets>=16.0
