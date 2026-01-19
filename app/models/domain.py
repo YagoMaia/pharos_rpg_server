@@ -2,8 +2,6 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel
 
-# --- Tipos Primitivos e Enums ---
-
 AttributeName = Literal[
     "Constituição", "Força", "Carisma", "Sabedoria", "Inteligência", "Destreza"
 ]
@@ -13,8 +11,6 @@ CharacterClass = Literal[
 ]
 
 ActionType = Literal["Padrão", "Movimento", "Reação", "Completa", "Livre", "Ação Bônus"]
-
-# --- Sub-modelos ---
 
 
 class Attribute(BaseModel):
@@ -62,10 +58,9 @@ class Spell(BaseModel):
     effect: str = ""
     cost: int = 0
 
-    # Campos de Automação de Combate
     isAttack: bool = False
     damageFormula: Optional[str] = None  # Ex: "1d10"
-    actionType: str = "standard"  # "standard", "bonus", "reaction"
+    actionType: str = "standard"
 
 
 class Combatant(BaseModel):
@@ -80,7 +75,6 @@ class Combatant(BaseModel):
     maxFocus: int
     currentFocus: int
 
-    # OptionalDict para lidar com Record<AttributeName, Attribute>
     attributes: Dict[str, Attribute] = {}
 
     equipment: Optional[str] = None  # String simplificada para combate
@@ -95,9 +89,6 @@ class Combatant(BaseModel):
     turnActions: TurnActions
 
 
-# --- Estado da Sessão (O que vai para o Redis) ---
-
-
 class CombatSession(BaseModel):
     session_id: str
     turn_index: int = 0
@@ -106,12 +97,3 @@ class CombatSession(BaseModel):
     # Mapa de ID -> Combatant
     combatants: Dict[str, Combatant]
     logs: List[str] = []
-
-
-# class CombatState(BaseModel):
-#     session_id: str
-#     turn_index: int = 0  # Índice do array de turn_order
-#     turn_order: List[str]  # Lista de IDs dos personagens ordenados
-#     entities: dict[str, Character]  # Mapa de ID -> Personagem
-#     active: bool = True
-#     logs: List[str] = []
