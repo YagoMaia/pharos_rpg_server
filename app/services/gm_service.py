@@ -76,14 +76,9 @@ class GMService:
         if c_id in state.turn_order:
             state.turn_order.remove(c_id)
 
-        # 4. Ajuste Matemático do Turno (A parte crítica!)
-        # Se removemos alguém que estava ANTES do jogador atual na fila,
-        # o índice do jogador atual diminui em 1 (a fila andou para trás).
         if removed_index != -1 and removed_index < state.turn_index:
             state.turn_index = max(0, state.turn_index - 1)
 
-        # Se removemos O jogador atual, o índice agora aponta para o próximo automaticamente,
-        # mas precisamos garantir que não estourou o tamanho da lista.
         if len(state.turn_order) > 0:
             state.turn_index = state.turn_index % len(state.turn_order)
         else:

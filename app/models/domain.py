@@ -62,6 +62,14 @@ class Spell(BaseModel):
     damageFormula: Optional[str] = None  # Ex: "1d10"
     actionType: str = "standard"
 
+    isHealing: bool = False
+    healFormula: Optional[str] = None
+
+
+class DeathSaves(BaseModel):
+    successes: int = 0
+    failures: int = 0
+
 
 class Combatant(BaseModel):
     id: str
@@ -69,15 +77,14 @@ class Combatant(BaseModel):
     baseName: Optional[str] = None
     initiative: int
     hp: StatsPair
+    focus: StatsPair
     type: Literal["player", "npc"]
 
     armorClass: int
-    maxFocus: int
-    currentFocus: int
 
     attributes: Dict[str, Attribute] = {}
 
-    equipment: Optional[str] = None  # String simplificada para combate
+    equipment: Optional[str] = None
     actions: Optional[str] = None
 
     stances: List[Stance] = []
@@ -87,6 +94,7 @@ class Combatant(BaseModel):
     activeStanceId: Optional[str] = None
 
     turnActions: TurnActions
+    deathSaves: DeathSaves = DeathSaves()
 
 
 class CombatSession(BaseModel):

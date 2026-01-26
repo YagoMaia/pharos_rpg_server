@@ -64,6 +64,9 @@ class GameLogic:
             case "RESOLVE_ACTION":
                 await PlayerService.resolve_action(state, payload)
 
+            case "ROLL_DEATH_SAVE":
+                await PlayerService.roll_death_save(state, payload)
+
         # Salva e notifica a todos
         if state and state.session_id:
             await self.manager.broadcast_state(session_id, state)

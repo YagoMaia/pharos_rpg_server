@@ -19,7 +19,6 @@ class ConnectionManager:
             self.active_connections[session_id] = []
         self.active_connections[session_id].append(websocket)
 
-        # Inscrever-se no canal do Redis para essa sessão
         # Nota: Em produção, o subscriber deve rodar em uma task separada para não bloquear
         asyncio.create_task(self.subscribe_channel(session_id))
 
@@ -35,7 +34,6 @@ class ConnectionManager:
             async for message in pubsub.listen():
                 if message["type"] == "message":
                     data = message["data"]
-                    # Envia para TODOS os sockets conectados nesta sessão
                     if session_id in self.active_connections:
                         for connection in self.active_connections[session_id]:
                             try:
@@ -46,16 +44,9 @@ class ConnectionManager:
             print(f"Erro no PubSub: {e}")
 
     async def broadcast_state(self, session_id: str, state: CombatSession):
-        # 1. Serializa o Objeto Pydantic para String JSON
-        # ATENÇÃO: Se usar Pydantic V2, use state.model_dump_json()
         state_json = state.model_dump_json()
 
-        print(f"📡 Enviando broadcast para {session_id}...")  # Debug
-
-        # 2. Salva no Redis (Persistência)
         await self.redis.set(f"state:{session_id}", state_json, ex=3600)
-
-        # 3. Publica no canal (Para o subscribe_channel pegar)
         await self.redis.publish(f"channel:{session_id}", state_json)
 
     async def get_state(self, session_id: str) -> Optional[CombatSession]:

@@ -1,3 +1,5 @@
+import random
+
 from app.models.domain import Combatant, CombatSession
 from app.models.events import ResolveActionPayload
 from app.services.gm_service import GMService
@@ -13,41 +15,26 @@ class PlayerService:
 
         new_combatant = Combatant(**combatant_data)
 
-        # 1. VERIFICAÇÃO SEGURA: Checa se o ID já está nas chaves do dicionário
         if new_combatant.id in state.combatants:
-            # Recupera a versão que está salva no Redis (O estado da batalha)
             existing = state.combatants[new_combatant.id]
 
-            # --- LÓGICA DE MERGE (ATUALIZAÇÃO SEGURA) ---
-
-            # Atualiza STATUS (Permite que ele volte curado/descansado)
             existing.hp = new_combatant.hp
-            existing.currentFocus = new_combatant.currentFocus
-            existing.maxFocus = new_combatant.maxFocus
+            existing.focus.current = new_combatant.focus.current
+            existing.focus.max = new_combatant.focus.max
 
-            # Atualiza FICHA (Caso tenha trocado de arma ou upado de nível)
             existing.attributes = new_combatant.attributes
             existing.equipment = new_combatant.equipment
             existing.skills = new_combatant.skills
             existing.armorClass = new_combatant.armorClass
             existing.spells = new_combatant.spells
 
-            # --- O QUE NÃO ATUALIZAMOS (PROTEÇÃO) ---
-            # existing.initiative      -> Mantém o lugar na fila
-            # existing.turnActions     -> Impede "roubar" ações saindo e voltando
-            # existing.activeStanceId  -> Mantém a postura ativa
-
             state.logs.append(f"{new_combatant.name} retornou (Status Sincronizados).")
             return
 
-        # --- CENÁRIO: NOVO JOGADOR ---
-        # Adiciona ao dicionário
         state.combatants[new_combatant.id] = new_combatant
 
-        # Adiciona à ordem de turnos
         if new_combatant.id not in state.turn_order:
             state.turn_order.append(new_combatant.id)
-            # Reordena por iniciativa
             state.turn_order.sort(
                 key=lambda x: state.combatants[x].initiative, reverse=True
             )
@@ -61,26 +48,32 @@ class PlayerService:
 
         combatant = state.combatants.get(target_id)
         if combatant:
-            diff = combatant.hp.current - new_hp
+            old_hp = combatant.hp.current
+
+            # --- REGRA DE OURO: CURA RESETTA MORTE ---
+            # Se estava com 0 e recebeu cura (new_hp > 0), reseta os testes
+            if old_hp <= 0 and new_hp > 0:
+                combatant.deathSaves.successes = 0
+                combatant.deathSaves.failures = 0
+                state.logs.append(f"{combatant.name} recuperou a consciência!")
+
             combatant.hp.current = new_hp
 
-            # Log simples
+            diff = old_hp - new_hp
             action_text = "curado em" if diff < 0 else "recebeu dano de"
             state.logs.append(f"{combatant.name} {action_text} {abs(diff)} PV.")
 
             if combatant.hp.current == 0:
-                state.logs.append(f"{combatant.name} caiu!")
+                state.logs.append(f"{combatant.name} caiu inconsciente!")
 
     @staticmethod
     async def change_stance(state: CombatSession, payload: dict):
         c_id = payload["combatantId"]
         s_id = payload["stanceId"]
-        new_ac = payload["newAC"]  # Front já calculou (Base + Bonus da Stance)
+        new_ac = payload["newAC"]
 
         combatant = state.combatants.get(c_id)
         if combatant:
-            # Busca o nome da postura para o log
-
             if s_id is None:
                 state.logs.append(
                     f"{combatant.name} assumiu a postura Neutra (CA {new_ac})."
@@ -102,38 +95,61 @@ class PlayerService:
 
     @staticmethod
     async def next_turn(state: CombatSession):
-        # 1. Finaliza turno do atual
-        current_id = state.turn_order[state.turn_index]
-        current_actor = state.combatants.get(current_id)
+        # 1. Finaliza o turno do atual (sem alterações)
+        # current_id = state.turn_order[state.turn_index]
+        # (Opcional: lógica de fim de turno, ex: remover buffs temporários)
 
-        if not current_actor:
-            return
-
-        # Opcional: Resetar reações do personagem que acabou de agir?
-        # current_actor.turnActions.bonus = True
-        # current_actor.turnActions.standard = True
-        # current_actor.turnActions.reaction = True
-        # Depende da regra do seu sistema (Geralmente reseta no INÍCIO do turno dele)
-
-        # 2. Calcula próximo índice
+        # 2. Avança o índice
         state.turn_index = (state.turn_index + 1) % len(state.turn_order)
 
-        # 3. Prepara o próximo
+        # 3. Identifica o próximo
         next_id = state.turn_order[state.turn_index]
         next_actor = state.combatants.get(next_id)
 
-        if next_actor:
-            if next_actor.hp.current <= 0 and next_actor.type == "npc":
-                state.logs.append(f"{next_actor.name} Morto")
-                await GMService.remove_combatant(state, {"combatantId": next_actor.id})
-                return
-            # REGRA DE OURO: Resetar economia de ações no INÍCIO do turno
-            next_actor.turnActions.standard = True
-            next_actor.turnActions.bonus = True
-            next_actor.turnActions.reaction = True
-            # (Reação às vezes reseta no início da RODADA, ajuste conforme seu sistema)
+        if not next_actor:
+            return
 
-            state.logs.append(f"--- Turno de {next_actor.name} ---")
+        # --- LÓGICA DE MORTE E INCONSCIÊNCIA ---
+
+        if next_actor.hp.current <= 0:
+            # CASO A: NPC com 0 PV -> Morre e sai do jogo
+            if next_actor.type == "npc":
+                state.logs.append(f"💀 {next_actor.name} foi removido.")
+                # Remove o NPC
+                await GMService.remove_combatant(state, {"combatantId": next_actor.id})
+                # IMPORTANTE: Chama next_turn de novo para achar o próximo válido (Recursão)
+                await PlayerService.next_turn(state)
+                return
+
+            # CASO B: Jogador MORTO (3 Falhas) -> Pula o turno
+            if next_actor.deathSaves.failures >= 3:
+                state.logs.append(f"⚰️ {next_actor.name} está morto e pulou o turno.")
+                await PlayerService.next_turn(state)
+                return
+
+            # CASO C: Jogador ESTÁVEL (3 Sucessos) -> Pula o turno (Dorme)
+            if next_actor.deathSaves.successes >= 3:
+                state.logs.append(
+                    f"💤 {next_actor.name} está estabilizado (inconsciente)."
+                )
+                await PlayerService.next_turn(state)
+                return
+
+            # (Já que o botão consome a Ação Padrão)
+            next_actor.turnActions.standard = True
+            next_actor.turnActions.bonus = False
+            next_actor.turnActions.reaction = False
+
+            state.logs.append(f"🚑 --- Turno de {next_actor.name} (TESTE DE MORTE) ---")
+            return
+
+        # --- CASO E: VIDA NORMAL ---
+        # Reseta economia de ações completa
+        next_actor.turnActions.standard = True
+        next_actor.turnActions.bonus = True
+        next_actor.turnActions.reaction = True
+
+        state.logs.append(f"⚔️ --- Turno de {next_actor.name} ---")
 
     @staticmethod
     async def resolve_action(state: CombatSession, payload: dict):
@@ -143,24 +159,16 @@ class PlayerService:
         if not attacker:
             return
 
-        # --- 0. VALIDAÇÃO DE TURNO (A MUDANÇA ESTÁ AQUI) ---
-
-        # Quem é o dono do turno atual?
         current_turn_id = state.turn_order[state.turn_index]
 
-        # Se NÃO é o turno do atacante E NÃO é uma reação, bloqueia.
         if attacker.id != current_turn_id and data.costType != "reaction":
-            # (Opcional) Enviar erro para o usuário via socket individual
             print(f"Bloqueado: {attacker.name} tentou agir fora do turno.")
             return
 
-        # --- 1. VERIFICAÇÃO DE ECONOMIA DE AÇÕES (Action Economy) ---
-        # Se for um ataque básico ou skill, consome a ação padrão/bônus
         if data.costType == "standard":
             if not attacker.turnActions.standard:
-                # Opcional: Logar tentativa falha
                 return
-            attacker.turnActions.standard = False  # GASTOU A AÇÃO
+            attacker.turnActions.standard = False
 
         elif data.costType == "bonus":
             if not attacker.turnActions.bonus:
@@ -172,26 +180,21 @@ class PlayerService:
                 return
             attacker.turnActions.reaction = False
 
-        # --- 2. VERIFICAÇÃO DE RECURSOS (FOCO) ---
-        # Se for Ataque Básico, focusCost será 0, então passa direto
         if data.focusCost > 0:
-            if attacker.currentFocus < data.focusCost:
+            if attacker.focus.current < data.focusCost:
                 state.logs.append(
                     f"{attacker.name} tentou usar {data.actionName} sem Foco suficiente."
                 )
-                # Devolve a ação que foi gasta no passo 1 (Rollback simples)
                 if data.costType == "standard":
                     attacker.turnActions.standard = True
                 return
 
-            attacker.currentFocus -= data.focusCost
+            attacker.focus.current -= data.focusCost
 
-        # --- 3. APLICAÇÃO DE EFEITOS (DANO/CURA) ---
         target = state.combatants.get(data.targetId) if data.targetId else None
         log_detail = ""
 
         if target:
-            # Lógica de Dano
             if data.damageAmount > 0:
                 old_hp = target.hp.current
                 target.hp.current = max(0, target.hp.current - data.damageAmount)
@@ -201,7 +204,6 @@ class PlayerService:
                 if target.hp.current == 0:
                     log_detail += " (CAIU!)"
 
-            # Lógica de Cura
             elif data.healingAmount > 0:
                 old_hp = target.hp.current
                 target.hp.current = min(
@@ -215,5 +217,64 @@ class PlayerService:
         else:
             log_detail = "(efeito sem alvo)"
 
-        # --- 4. LOG FINAL ---
         state.logs.append(f"{attacker.name} usou {data.actionName} {log_detail}.")
+
+    @staticmethod
+    async def roll_death_save(state: CombatSession, payload: dict):
+        c_id = payload["combatantId"]
+        combatant = state.combatants.get(c_id)
+
+        if not combatant:
+            return
+
+        d20 = payload.get("rollValue", random.randint(1, 20))
+
+        log_msg = f"Teste de Morte: Rolou {d20} -> "
+
+        # 2. Regra do 20 Natural (Crítico Sucesso)
+        if d20 == 20:
+            combatant.hp.current = 1
+            combatant.deathSaves.successes = 0
+            combatant.deathSaves.failures = 0
+            combatant.turnActions.standard = False  # Consome ação
+            state.logs.append(
+                f"{combatant.name} {log_msg} 20 NATURAL! Renasceu com 1 PV!"
+            )
+            return
+
+        # 3. Regra do 1 Natural (Crítica Falha)
+        if d20 == 1:
+            combatant.deathSaves.failures += 2
+            log_msg += "Falha Crítica (2 falhas)!"
+
+        # 4. Sucesso (>= 10)
+        elif d20 >= 10:
+            combatant.deathSaves.successes += 1
+            log_msg += "Sucesso."
+
+        # 5. Falha (< 10)
+        else:
+            combatant.deathSaves.failures += 1
+            log_msg += "Falha."
+
+        # 6. Consome a ação do turno
+        combatant.turnActions.standard = False
+
+        # --- VERIFICAÇÃO DE FIM DE LINHA ---
+
+        # Se estabilizou (3 Sucessos)
+        if combatant.deathSaves.successes >= 3:
+            combatant.deathSaves.successes = 0
+            combatant.deathSaves.failures = 0
+            combatant.hp.current = 1
+            log_msg += " ESTABILIZOU! (Inconsciente, mas salvo)."
+
+        # Se Morreu (3 Falhas)
+        elif combatant.deathSaves.failures >= 3:
+            log_msg += " MORREU."
+            # Aqui você pode mudar o ícone para caveira ou remover do combate
+            await GMService.remove_combatant(state, {"combatantId": c_id})
+
+        state.logs.append(
+            f"{combatant.name}: {log_msg} [S:{combatant.deathSaves.successes}/F:{combatant.deathSaves.failures}]"
+        )

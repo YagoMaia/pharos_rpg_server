@@ -11,9 +11,9 @@ class RemoveCombatantPayload(BaseModel):
 
 class ResolveActionPayload(BaseModel):
     attackerId: str
-    targetId: Optional[str] = None  # Pode ser null (ex: buff em si mesmo)
+    targetId: Optional[str] = None  
 
-    actionName: str  # Ex: "Espada Longa", "Bola de Fogo", "Cura"
+    actionName: str 
 
     # CUSTOS
     costType: ActionCostType = "standard"
