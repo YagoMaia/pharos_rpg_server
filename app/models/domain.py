@@ -75,6 +75,8 @@ class Combatant(BaseModel):
     id: str
     name: str
     baseName: Optional[str] = None
+    image: Optional[str] = None
+
     initiative: int
     hp: StatsPair
     focus: StatsPair

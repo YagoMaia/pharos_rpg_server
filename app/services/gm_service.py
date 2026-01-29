@@ -85,3 +85,36 @@ class GMService:
             state.turn_index = 0
 
         state.logs.append(f"{name} foi removido do combate.")
+
+    @staticmethod
+    async def end_combat(state: CombatSession):
+        # 1. Identificar quem são os jogadores (para mantê-los)
+        player_ids = [
+            c_id for c_id, char in state.combatants.items() if char.type == "player"
+        ]
+
+        # 2. Resetar Ações dos Jogadores (Restaurar economia de ação)
+        for p_id in player_ids:
+            player = state.combatants[p_id]
+            player.turnActions.standard = True
+            player.turnActions.bonus = True
+            player.turnActions.reaction = True
+            # Opcional: Remover posturas de combate?
+            # player.activeStanceId = None
+
+        # 3. Limpar NPCs da memória (Combatants)
+        # Cria um novo dict apenas com os players
+        state.combatants = {p_id: state.combatants[p_id] for p_id in player_ids}
+
+        # 4. Limpar a Ordem de Turno
+        # Opção A: Zera tudo (Ninguém tem turno)
+        state.turn_order = []
+        state.turn_index = 0
+
+        # Opção B (Recomendada): Mantém players na lista para eles verem seus HPs,
+        # mas sem ordem de iniciativa específica.
+        state.turn_order = player_ids
+
+        # Log Final
+        print("End Combat")
+        state.logs.append("🏆 O Mestre encerrou o combate! (Modo Narrativo)")

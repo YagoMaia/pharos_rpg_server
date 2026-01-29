@@ -49,6 +49,9 @@ class GameLogic:
             case "GM_REMOVE_COMBATANT":
                 await GMService.remove_combatant(state, payload)
 
+            case "END_COMBAT":
+                await GMService.end_combat(state)
+
             case "JOIN_SESSION":
                 await PlayerService.join_session(state, payload)
 
@@ -70,3 +73,7 @@ class GameLogic:
         # Salva e notifica a todos
         if state and state.session_id:
             await self.manager.broadcast_state(session_id, state)
+
+        print(state.turn_order)
+        print(state.turn_index)
+        # print(state.activeTurnId)
