@@ -9,7 +9,7 @@ router = APIRouter()
 game_logic = GameLogic(manager)
 
 
-@router.websocket("/ws/{session_id}/{character_id}")
+@router.websocket("/ws/{session_id}")
 async def combat_endpoint(websocket: WebSocket, session_id: str):
     await manager.connect(session_id, websocket)
     try:

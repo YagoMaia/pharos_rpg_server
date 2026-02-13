@@ -26,8 +26,8 @@ class GameLogic:
 
         if not state:
             if event_type in ["JOIN_SESSION", "GM_CONNECT"]:
+                session_id = session_id.lower()
                 state = self._create_session(session_id)
-                print(f"Sessão {session_id} criada por {event_type}")
             else:
                 return
 
@@ -73,7 +73,3 @@ class GameLogic:
         # Salva e notifica a todos
         if state and state.session_id:
             await self.manager.broadcast_state(session_id, state)
-
-        print(state.turn_order)
-        print(state.turn_index)
-        # print(state.activeTurnId)

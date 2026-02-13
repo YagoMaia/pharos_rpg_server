@@ -1,5 +1,7 @@
 import random
+import time
 
+from app.core.utils import static_method_log
 from app.models.domain import Combatant, CombatSession
 from app.models.events import ResolveActionPayload
 from app.services.gm_service import GMService
@@ -7,6 +9,7 @@ from app.services.gm_service import GMService
 
 class PlayerService:
     @staticmethod
+    @static_method_log
     async def join_session(state: CombatSession, payload: dict):
         combatant_data = payload.get("combatant")
 
@@ -42,6 +45,7 @@ class PlayerService:
         state.logs.append(f"{new_combatant.name} entrou no combate.")
 
     @staticmethod
+    @static_method_log
     async def update_hp(state: CombatSession, payload: dict):
         target_id = payload["combatantId"]
         new_hp = payload["newHp"]
@@ -67,6 +71,7 @@ class PlayerService:
                 state.logs.append(f"{combatant.name} caiu inconsciente!")
 
     @staticmethod
+    @static_method_log
     async def change_stance(state: CombatSession, payload: dict):
         c_id = payload["combatantId"]
         s_id = payload["stanceId"]
@@ -94,6 +99,7 @@ class PlayerService:
             )
 
     @staticmethod
+    @static_method_log
     async def next_turn(state: CombatSession):
         # 1. Finaliza o turno do atual (sem alterações)
         # current_id = state.turn_order[state.turn_index]
@@ -152,8 +158,12 @@ class PlayerService:
         state.logs.append(f"⚔️ --- Turno de {next_actor.name} ---")
 
     @staticmethod
+    @static_method_log
     async def resolve_action(state: CombatSession, payload: dict):
         data = ResolveActionPayload(**payload)
+        damage_done = 0
+        healed = 0
+        event_type = "info"  # default
 
         attacker = state.combatants.get(data.attackerId)
         if not attacker:
@@ -162,7 +172,6 @@ class PlayerService:
         current_turn_id = state.turn_order[state.turn_index]
 
         if attacker.id != current_turn_id and data.costType != "reaction":
-            print(f"Bloqueado: {attacker.name} tentou agir fora do turno.")
             return
 
         if data.costType == "standard":
@@ -196,6 +205,7 @@ class PlayerService:
 
         if target:
             if data.damageAmount > 0:
+                event_type = "damage"
                 old_hp = target.hp.current
                 target.hp.current = max(0, target.hp.current - data.damageAmount)
                 damage_done = old_hp - target.hp.current
@@ -205,6 +215,7 @@ class PlayerService:
                     log_detail += " (CAIU!)"
 
             elif data.healingAmount > 0:
+                event_type = "heal"
                 old_hp = target.hp.current
                 target.hp.current = min(
                     target.hp.max, target.hp.current + data.healingAmount
@@ -218,8 +229,17 @@ class PlayerService:
             log_detail = "(efeito sem alvo)"
 
         state.logs.append(f"{attacker.name} usou {data.actionName} {log_detail}.")
+        state.last_event = {
+            "id": int(time.time() * 1000),
+            "type": event_type,
+            "target_id": target.id if target else None,
+            "attacker_name": attacker.name,
+            "skill_name": data.actionName,
+            "value": damage_done if event_type == "damage" else healed,
+        }
 
     @staticmethod
+    @static_method_log
     async def roll_death_save(state: CombatSession, payload: dict):
         c_id = payload["combatantId"]
         combatant = state.combatants.get(c_id)

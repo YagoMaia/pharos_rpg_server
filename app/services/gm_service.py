@@ -1,9 +1,11 @@
+from app.core.utils import static_method_log
 from app.models.domain import Combatant, CombatSession
 from app.models.events import RemoveCombatantPayload
 
 
 class GMService:
     @staticmethod
+    @static_method_log
     async def add_npc(state: CombatSession, payload: dict):
         new_npc = Combatant(**payload)
         state.combatants[new_npc.id] = new_npc
@@ -14,10 +16,12 @@ class GMService:
         state.logs.append(f"(GM) Adicionou: {new_npc.name}")
 
     @staticmethod
+    @static_method_log
     async def gm_connect(state: CombatSession):
         state.logs.append("O Mestre (GM) conectou na sala.")
 
     @staticmethod
+    @static_method_log
     async def update_combatant(state: CombatSession, payload: dict):
         target_id = payload["combatantId"]
         value = payload["value"]
@@ -38,18 +42,19 @@ class GMService:
                 if combatant.hp.current == 0:
                     state.logs.append(f"{combatant.name} caiu!")
             elif field == "current_focus":
-                diff = combatant.currentFocus - value
-                combatant.currentFocus = value
+                diff = combatant.focus.current - value
+                combatant.focus.current = value
 
                 action_text = "recuperou" if diff < 0 else "gastou"
                 state.logs.append(
                     f"Mestre {action_text} {combatant.name} - {abs(diff)} Foco."
                 )
 
-                if combatant.currentFocus == 0:
+                if combatant.focus.current == 0:
                     state.logs.append(f"{combatant.name} sem foco!")
 
     @staticmethod
+    @static_method_log
     async def remove_combatant(state: CombatSession, payload: dict):
         """
         Remove um combatente (morto ou deletado) e ajusta o índice de turno
@@ -87,6 +92,7 @@ class GMService:
         state.logs.append(f"{name} foi removido do combate.")
 
     @staticmethod
+    @static_method_log
     async def end_combat(state: CombatSession):
         # 1. Identificar quem são os jogadores (para mantê-los)
         player_ids = [
@@ -116,5 +122,4 @@ class GMService:
         state.turn_order = player_ids
 
         # Log Final
-        print("End Combat")
         state.logs.append("🏆 O Mestre encerrou o combate! (Modo Narrativo)")

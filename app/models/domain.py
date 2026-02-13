@@ -71,6 +71,14 @@ class DeathSaves(BaseModel):
     failures: int = 0
 
 
+class CombatWeaponData(BaseModel):
+    name: str
+    damage: str
+    attribute: AttributeName
+    attackBonus: int
+    range: str
+
+
 class Combatant(BaseModel):
     id: str
     name: str
@@ -88,6 +96,8 @@ class Combatant(BaseModel):
 
     equipment: Optional[str] = None
     actions: Optional[str] = None
+
+    # weapons: Optional[dict[str, CombatWeaponData]]
 
     stances: List[Stance] = []
     skills: List[Skill] = []
@@ -107,3 +117,4 @@ class CombatSession(BaseModel):
     # Mapa de ID -> Combatant
     combatants: Dict[str, Combatant]
     logs: List[str] = []
+    last_event: Optional[dict] = None
