@@ -12,6 +12,7 @@ class ConnectionManager:
     def __init__(self):
         self.redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
         self.active_connections: dict[str, list[WebSocket]] = {}
+        self.pubsub_tasks: dict[str, asyncio.Task] = {}
 
     async def connect(self, session_id: str, websocket: WebSocket):
         await websocket.accept()
@@ -19,29 +20,40 @@ class ConnectionManager:
             self.active_connections[session_id] = []
         self.active_connections[session_id].append(websocket)
 
-        # Nota: Em produção, o subscriber deve rodar em uma task separada para não bloquear
-        asyncio.create_task(self.subscribe_channel(session_id))
+        if session_id not in self.pubsub_tasks:
+            self.pubsub_tasks[session_id] = asyncio.create_task(
+                self.subscribe_channel(session_id)
+            )
 
     def disconnect(self, session_id: str, websocket: WebSocket):
         if session_id in self.active_connections:
             self.active_connections[session_id].remove(websocket)
+            if not self.active_connections[session_id]:
+                if session_id in self.pubsub_tasks:
+                    self.pubsub_tasks[session_id].cancel()
+                    del self.pubsub_tasks[session_id]
+                del self.active_connections[session_id]
 
     async def subscribe_channel(self, session_id: str):
+        """Escuta única que distribui para todos da sala"""
         pubsub = self.redis.pubsub()
         await pubsub.subscribe(f"channel:{session_id}")
-
         try:
             async for message in pubsub.listen():
                 if message["type"] == "message":
                     data = message["data"]
+                    # Distribui para todos os sockets conectados nesta sessão
                     if session_id in self.active_connections:
-                        for connection in self.active_connections[session_id]:
-                            try:
-                                await connection.send_text(data)
-                            except Exception as e:
-                                print(f"Erro ao enviar socket: {e}")
+                        targets = self.active_connections[session_id]
+                        # Envia em paralelo para não travar a escuta
+                        await asyncio.gather(
+                            *[conn.send_text(data) for conn in targets],
+                            return_exceptions=True,
+                        )
+        except asyncio.CancelledError:
+            await pubsub.unsubscribe(f"channel:{session_id}")
         except Exception as e:
-            print(f"Erro no PubSub: {e}")
+            print(f"Erro central no PubSub da sessão {session_id}: {e}")
 
     async def broadcast_state(self, session_id: str, state: CombatSession):
         state_json = state.model_dump_json()

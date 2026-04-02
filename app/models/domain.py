@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel
 
@@ -37,6 +37,17 @@ class Skill(BaseModel):
     actionType: ActionType
     description: str
     level: int
+
+    usesWeaponDamage: Optional[bool] = False
+    weaponType: Optional[str] = None
+    bonusDamage: Optional[str] = None
+    damageType: Optional[str] = None
+
+    isHealing: Optional[bool] = False
+    healFormula: Optional[str] = None
+
+    # Se quiser tipar o dicionário do saveRequest:
+    saveRequest: Optional[Dict[str, Any]] = None
 
 
 class Stance(BaseModel):
@@ -97,7 +108,7 @@ class Combatant(BaseModel):
     equipment: Optional[str] = None
     actions: Optional[str] = None
 
-    # weapons: Optional[dict[str, CombatWeaponData]]
+    weapons: Optional[dict[str, CombatWeaponData]] = None
 
     stances: List[Stance] = []
     skills: List[Skill] = []
