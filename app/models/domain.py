@@ -60,6 +60,23 @@ class Stance(BaseModel):
     acBonus: Optional[int] = 0
 
 
+# --- SISTEMA DE CONDIÇÕES ---
+ConditionName = Literal[
+    "Cego", "Surdo", "Prostrado", "Confuso", "Amedrontado",
+    "Intimidado", "Incapacitado", "Paralisado", "Envenenado",
+    "Agarrado", "Lento", "Atordoado"
+]
+
+
+class ActiveCondition(BaseModel):
+    id: str  # ID único da aplicação da condição
+    name: ConditionName
+    appliedAtTurn: int  # Turno em que foi aplicada
+    durationTurns: Optional[int] = None  # None = permanente até remoção manual
+    sourceId: str  # Quem aplicou
+    description: str  # Efeito mecânico
+
+
 class Spell(BaseModel):
     id: str
     name: str
@@ -119,6 +136,9 @@ class Combatant(BaseModel):
     spells: List[Spell] = []
 
     activeStanceId: Optional[str] = None
+
+    # Condições ativas (ex: Cego, Prostrado, Confuso)
+    conditions: List[ActiveCondition] = []
 
     turnActions: TurnActions
     deathSaves: DeathSaves = DeathSaves()

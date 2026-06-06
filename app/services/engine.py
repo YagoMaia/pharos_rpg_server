@@ -73,6 +73,10 @@ class GameLogic:
                     await PlayerService.resolve_action(state, payload)
                 case "ROLL_DEATH_SAVE":
                     await PlayerService.roll_death_save(state, payload)
+                case "APPLY_CONDITION":
+                    await PlayerService.apply_condition(state, payload)
+                case "REMOVE_CONDITION":
+                    await PlayerService.remove_condition(state, payload)
 
             # 5. Persistência e Broadcast (Ainda dentro do Lock)
             if state:

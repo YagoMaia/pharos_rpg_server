@@ -1,8 +1,13 @@
 import random
+import uuid
 
 from app.core.utils import static_method_log
-from app.models.domain import Combatant, CombatSession
-from app.models.events import ResolveActionPayload
+from app.models.domain import ActiveCondition, Combatant, CombatSession
+from app.models.events import (
+    ApplyConditionPayload,
+    RemoveConditionPayload,
+    ResolveActionPayload,
+)
 from app.services.gm_service import GMService
 
 
@@ -181,6 +186,36 @@ class PlayerService:
 
             log_msg = f"⚔️ --- Turno de {next_actor.name} ---"
 
+        # ═══════════════════════════════════════════════════════
+        # CONDIÇÕES: Decremento de duração no início do turno
+        # ═══════════════════════════════════════════════════════
+        expired_conditions = []
+        remaining_conditions = []
+        for cond in next_actor.conditions:
+            if cond.durationTurns is not None:
+                cond.durationTurns -= 1
+                if cond.durationTurns <= 0:
+                    expired_conditions.append(cond)
+                    continue
+            remaining_conditions.append(cond)
+
+        if expired_conditions:
+            next_actor.conditions = remaining_conditions
+            expired_names = ", ".join(c.name for c in expired_conditions)
+            cond_log = f"✨ {next_actor.name} se livrou de: {expired_names}."
+            state.logs.append(cond_log)
+
+            await manager.broadcast_event(
+                state.session_id,
+                "CONDITION_UPDATE",
+                {
+                    "combatantId": next_id,
+                    "conditions": [c.model_dump() for c in next_actor.conditions],
+                    "expired": [c.name for c in expired_conditions],
+                    "log": cond_log,
+                },
+            )
+
         state.logs.append(log_msg)
         await manager.broadcast_event(
             state.session_id,
@@ -264,6 +299,13 @@ class PlayerService:
             else:
                 final_log = f"{attacker.name} usou {data.actionName} (sem alvos válidos)."
 
+            # Aplica condições (multi-target)
+            applied_cond_logs = PlayerService._apply_conditions_from_action(
+                state, data, attacker
+            )
+            if applied_cond_logs:
+                final_log += " " + " ".join(applied_cond_logs)
+
             state.logs.append(final_log)
 
             await manager.broadcast_event(
@@ -307,7 +349,15 @@ class PlayerService:
                 healed = target.hp.current - old_hp
                 log_detail = f"curando {healed} PV de {target.name}"
 
+        # Aplica condições (single-target)
+        applied_cond_logs = PlayerService._apply_conditions_from_action(
+            state, data, attacker
+        )
+
         final_log = f"{attacker.name} usou {data.actionName} {log_detail}."
+        if applied_cond_logs:
+            final_log += " " + " ".join(applied_cond_logs)
+
         state.logs.append(final_log)
 
         await manager.broadcast_event(
@@ -326,6 +376,43 @@ class PlayerService:
                 "attackerFocus": attacker.focus.current,
             },
         )
+
+    # ═══════════════════════════════════════════════════════════
+    # HELPER: Aplica condições enviadas junto com uma ação
+    # ═══════════════════════════════════════════════════════════
+    @staticmethod
+    def _apply_conditions_from_action(
+        state: CombatSession,
+        data: ResolveActionPayload,
+        attacker: Combatant,
+    ) -> list[str]:
+        """Aplica condições embutidas em um RESOLVE_ACTION. Retorna logs."""
+        if not data.appliedConditions:
+            return []
+
+        from app.managers.connection import manager
+        import asyncio
+
+        logs = []
+        for cp in data.appliedConditions:
+            target = state.combatants.get(cp.targetId)
+            if not target:
+                continue
+
+            condition = ActiveCondition(
+                id=str(uuid.uuid4()),
+                name=cp.conditionName,
+                appliedAtTurn=state.turn_index,
+                durationTurns=cp.durationTurns,
+                sourceId=attacker.id,
+                description=cp.description,
+            )
+            target.conditions.append(condition)
+
+            duration_text = f" por {cp.durationTurns} turnos" if cp.durationTurns else ""
+            logs.append(f"⚡ {target.name} ficou {cp.conditionName}{duration_text}!")
+
+        return logs
 
     @staticmethod
     @static_method_log
@@ -368,5 +455,81 @@ class PlayerService:
                 "newHp": combatant.hp.current,
                 "log": log_msg,
                 "turnActions": combatant.turnActions.model_dump(),
+            },
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # CONDIÇÕES: Aplicação e Remoção Manual (GM)
+    # ═══════════════════════════════════════════════════════════
+
+    @staticmethod
+    @static_method_log
+    async def apply_condition(state: CombatSession, payload: dict):
+        """GM aplica manualmente uma condição a um combatente."""
+        data = ApplyConditionPayload(**payload)
+        combatant = state.combatants.get(data.combatantId)
+        if not combatant:
+            return
+
+        condition = ActiveCondition(
+            id=str(uuid.uuid4()),
+            name=data.conditionName,
+            appliedAtTurn=state.turn_index,
+            durationTurns=data.durationTurns,
+            sourceId="gm",
+            description=data.description,
+        )
+        combatant.conditions.append(condition)
+
+        duration_text = f" por {data.durationTurns} turnos" if data.durationTurns else ""
+        log_msg = f"🎯 {combatant.name} recebeu a condição {data.conditionName}{duration_text}."
+        state.logs.append(log_msg)
+
+        from app.managers.connection import manager
+
+        await manager.broadcast_event(
+            state.session_id,
+            "CONDITION_UPDATE",
+            {
+                "combatantId": data.combatantId,
+                "conditions": [c.model_dump() for c in combatant.conditions],
+                "applied": condition.model_dump(),
+                "log": log_msg,
+            },
+        )
+
+    @staticmethod
+    @static_method_log
+    async def remove_condition(state: CombatSession, payload: dict):
+        """GM ou sistema remove uma condição pelo ID."""
+        data = RemoveConditionPayload(**payload)
+        combatant = state.combatants.get(data.combatantId)
+        if not combatant:
+            return
+
+        removed = None
+        for cond in combatant.conditions:
+            if cond.id == data.conditionId:
+                removed = cond
+                break
+
+        if not removed:
+            return
+
+        combatant.conditions = [c for c in combatant.conditions if c.id != data.conditionId]
+
+        log_msg = f"✨ {combatant.name} não está mais {removed.name}."
+        state.logs.append(log_msg)
+
+        from app.managers.connection import manager
+
+        await manager.broadcast_event(
+            state.session_id,
+            "CONDITION_UPDATE",
+            {
+                "combatantId": data.combatantId,
+                "conditions": [c.model_dump() for c in combatant.conditions],
+                "removed": removed.model_dump(),
+                "log": log_msg,
             },
         )

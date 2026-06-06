@@ -4,6 +4,12 @@ from pydantic import BaseModel
 
 ActionCostType = Literal["standard", "bonus", "reaction", "free", "none"]
 
+ConditionName = Literal[
+    "Cego", "Surdo", "Prostrado", "Confuso", "Amedrontado",
+    "Intimidado", "Incapacitado", "Paralisado", "Envenenado",
+    "Agarrado", "Lento", "Atordoado"
+]
+
 
 class RemoveCombatantPayload(BaseModel):
     combatantId: str
@@ -14,6 +20,30 @@ class ActionTarget(BaseModel):
     targetId: str
     damageAmount: int = 0
     healingAmount: int = 0
+
+
+# --- SISTEMA DE CONDIÇÕES ---
+
+class ConditionPayload(BaseModel):
+    """Condição a ser aplicada em um alvo durante uma ação."""
+    targetId: str
+    conditionName: ConditionName
+    durationTurns: Optional[int] = None  # None = permanente
+    description: str
+
+
+class ApplyConditionPayload(BaseModel):
+    """GM aplica manualmente uma condição."""
+    combatantId: str
+    conditionName: ConditionName
+    durationTurns: Optional[int] = None
+    description: str
+
+
+class RemoveConditionPayload(BaseModel):
+    """GM ou sistema remove uma condição pelo ID."""
+    combatantId: str
+    conditionId: str
 
 
 class ResolveActionPayload(BaseModel):
@@ -32,3 +62,7 @@ class ResolveActionPayload(BaseModel):
     # EFEITOS single-target (Calculados no frontend)
     damageAmount: int = 0
     healingAmount: int = 0
+
+    # CONDIÇÕES a aplicar nos alvos
+    appliedConditions: Optional[List[ConditionPayload]] = None
+
