@@ -196,7 +196,7 @@ class PlayerService:
     @staticmethod
     @static_method_log
     async def resolve_action(state: CombatSession, payload: dict):
-        """Processa ataques/curas e dispara evento Delta."""
+        """Processa ataques/curas (single ou multi-target) e dispara evento Delta."""
         data = ResolveActionPayload(**payload)
         attacker = state.combatants.get(data.attackerId)
         if not attacker:
@@ -217,9 +217,77 @@ class PlayerService:
             state.logs.append(f"{attacker.name} sem foco para {data.actionName}.")
             return
 
-        # Execução
+        # Consome ação e foco
         setattr(attacker.turnActions, cost_attr, False)
         attacker.focus.current -= data.focusCost
+
+        from app.managers.connection import manager
+
+        # ═══════════════════════════════════════════════════════
+        # MULTI-TARGET: Processa lista de alvos individuais
+        # ═══════════════════════════════════════════════════════
+        if data.targets and len(data.targets) > 0:
+            results = []
+            log_parts = []
+
+            for t in data.targets:
+                target = state.combatants.get(t.targetId)
+                if not target:
+                    continue
+
+                damage_done, healed, event_type = 0, 0, "info"
+
+                if t.damageAmount > 0:
+                    event_type = "damage"
+                    old_hp = target.hp.current
+                    target.hp.current = max(0, target.hp.current - t.damageAmount)
+                    damage_done = old_hp - target.hp.current
+                    log_parts.append(f"{damage_done} dano em {target.name}")
+                elif t.healingAmount > 0:
+                    event_type = "heal"
+                    old_hp = target.hp.current
+                    target.hp.current = min(
+                        target.hp.max, target.hp.current + t.healingAmount
+                    )
+                    healed = target.hp.current - old_hp
+                    log_parts.append(f"{healed} PV curados em {target.name}")
+
+                results.append({
+                    "targetId": target.id,
+                    "targetHp": target.hp.current,
+                    "type": event_type,
+                    "value": damage_done if event_type == "damage" else healed,
+                })
+
+            if log_parts:
+                final_log = f"{attacker.name} usou {data.actionName}: {', '.join(log_parts)}."
+            else:
+                final_log = f"{attacker.name} usou {data.actionName} (sem alvos válidos)."
+
+            state.logs.append(final_log)
+
+            await manager.broadcast_event(
+                state.session_id,
+                "ACTION_RESOLVED",
+                {
+                    "type": "multi",
+                    "attackerId": attacker.id,
+                    "targetId": None,
+                    "targetHp": None,
+                    "actionName": data.actionName,
+                    "value": 0,
+                    "focusCost": data.focusCost,
+                    "log": final_log,
+                    "attackerActions": attacker.turnActions.model_dump(),
+                    "attackerFocus": attacker.focus.current,
+                    "results": results,
+                },
+            )
+            return
+
+        # ═══════════════════════════════════════════════════════
+        # SINGLE-TARGET: Fluxo original (retrocompatibilidade)
+        # ═══════════════════════════════════════════════════════
         target = state.combatants.get(data.targetId) if data.targetId else None
 
         damage_done, healed, event_type = 0, 0, "info"
@@ -241,8 +309,6 @@ class PlayerService:
 
         final_log = f"{attacker.name} usou {data.actionName} {log_detail}."
         state.logs.append(final_log)
-
-        from app.managers.connection import manager
 
         await manager.broadcast_event(
             state.session_id,
