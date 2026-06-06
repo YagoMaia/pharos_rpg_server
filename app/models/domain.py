@@ -91,6 +91,8 @@ class CombatWeaponData(BaseModel):
 
 
 class Combatant(BaseModel):
+    model_config = {"extra": "ignore"}
+
     id: str
     name: str
     baseName: Optional[str] = None
@@ -99,9 +101,11 @@ class Combatant(BaseModel):
     initiative: int
     hp: StatsPair
     focus: StatsPair
-    type: Literal["player", "npc"]
+    type: Literal["player", "npc", "pet"]
+    ownerId: Optional[str] = None  # ID do player dono (para pets)
 
     armorClass: int
+    speed: Optional[str] = None
 
     attributes: Dict[str, Attribute] = {}
 

@@ -18,7 +18,8 @@ class GMService:
     @staticmethod
     @static_method_log
     async def gm_connect(state: CombatSession):
-        state.logs.append("O Mestre (GM) conectou na sala.")
+        if not state.logs or "Mestre (GM) conectou" not in state.logs[-1]:
+            state.logs.append("O Mestre (GM) conectou na sala.")
 
     @staticmethod
     @static_method_log
@@ -30,28 +31,37 @@ class GMService:
         combatant = state.combatants.get(target_id)
 
         if combatant:
+            from app.managers.connection import manager
+
+            # 1. Calcula a diferença e gera o texto do log conforme o campo alterado
             if field == "hp_current":
                 diff = combatant.hp.current - value
+                action_text = "curou" if diff < 0 else "deu dano em"
+                log_msg = f"Mestre {action_text} {combatant.name}: {abs(diff)} PV."
                 combatant.hp.current = value
-
-                action_text = "curou" if diff < 0 else "deu dano"
-                state.logs.append(
-                    f"Mestre {action_text} {combatant.name} - {abs(diff)} PV."
-                )
-
-                if combatant.hp.current == 0:
-                    state.logs.append(f"{combatant.name} caiu!")
-            elif field == "current_focus":
+            else:  # field == "current_focus"
                 diff = combatant.focus.current - value
+                action_text = "recuperou" if diff < 0 else "gastou"
+                log_msg = f"Mestre {action_text} foco de {combatant.name}: {abs(diff)}."
                 combatant.focus.current = value
 
-                action_text = "recuperou" if diff < 0 else "gastou"
-                state.logs.append(
-                    f"Mestre {action_text} {combatant.name} - {abs(diff)} Foco."
-                )
+            # 2. IMPORTANTE: Adiciona o log ao estado da sessão para ser persistido
+            state.logs.append(log_msg)
 
-                if combatant.focus.current == 0:
-                    state.logs.append(f"{combatant.name} sem foco!")
+            # 3. Determina as chaves do evento para o broadcast
+            event = "HP_UPDATE" if field == "hp_current" else "FOCUS_UPDATE"
+            payload_key = "newHp" if field == "hp_current" else "newFocus"
+
+            # 4. Envia o evento com o log recém-criado
+            await manager.broadcast_event(
+                state.session_id,
+                event,
+                {
+                    "combatantId": target_id,
+                    payload_key: value,
+                    "log": state.logs[-1],  # Agora state.logs[-1] é o log_msg acima
+                },
+            )
 
     @staticmethod
     @static_method_log

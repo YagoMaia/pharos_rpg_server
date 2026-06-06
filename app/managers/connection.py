@@ -1,5 +1,5 @@
 import asyncio
-from typing import Optional
+import json
 
 from fastapi import WebSocket
 from redis import asyncio as aioredis
@@ -15,6 +15,7 @@ class ConnectionManager:
         self.pubsub_tasks: dict[str, asyncio.Task] = {}
 
     async def connect(self, session_id: str, websocket: WebSocket):
+        session_id = session_id.lower()
         await websocket.accept()
         if session_id not in self.active_connections:
             self.active_connections[session_id] = []
@@ -26,6 +27,7 @@ class ConnectionManager:
             )
 
     def disconnect(self, session_id: str, websocket: WebSocket):
+        session_id = session_id.lower()
         if session_id in self.active_connections:
             self.active_connections[session_id].remove(websocket)
             if not self.active_connections[session_id]:
@@ -42,14 +44,19 @@ class ConnectionManager:
             async for message in pubsub.listen():
                 if message["type"] == "message":
                     data = message["data"]
-                    # Distribui para todos os sockets conectados nesta sessão
                     if session_id in self.active_connections:
-                        targets = self.active_connections[session_id]
-                        # Envia em paralelo para não travar a escuta
-                        await asyncio.gather(
+                        targets = list(self.active_connections[session_id])
+                        results = await asyncio.gather(
                             *[conn.send_text(data) for conn in targets],
                             return_exceptions=True,
                         )
+                        # Remove conexões mortas que falharam no envio
+                        for conn, result in zip(targets, results):
+                            if isinstance(result, Exception):
+                                try:
+                                    self.active_connections[session_id].remove(conn)
+                                except ValueError:
+                                    pass
         except asyncio.CancelledError:
             await pubsub.unsubscribe(f"channel:{session_id}")
         except Exception as e:
@@ -61,11 +68,17 @@ class ConnectionManager:
         await self.redis.set(f"state:{session_id}", state_json, ex=3600)
         await self.redis.publish(f"channel:{session_id}", state_json)
 
-    async def get_state(self, session_id: str) -> Optional[CombatSession]:
-        data = await self.redis.get(f"state:{session_id}")
-        if data:
-            return CombatSession.model_validate_json(data)
-        return None
+    async def get_state(self, session_id: str) -> CombatSession | None:
+        # Use EXATAMENTE o mesmo prefixo que o engine.py usa para salvar
+        raw_state = await self.redis.get(f"state:{session_id}")
+        if not raw_state:
+            return None
+        return CombatSession.model_validate_json(raw_state)
+
+    async def broadcast_event(self, session_id: str, event_type: str, payload: dict):
+        """Envia apenas um evento específico (ex: HP_UPDATE) em vez do estado todo"""
+        event_data = {"type": event_type, "payload": payload}
+        await self.redis.publish(f"channel:{session_id}", json.dumps(event_data))
 
 
 manager = ConnectionManager()

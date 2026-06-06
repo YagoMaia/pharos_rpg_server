@@ -10,21 +10,18 @@ logging.basicConfig(
 
 def static_method_log(func):
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    async def wrapper(*args, **kwargs):
         nome_funcao = func.__name__
-        logging.info(f"Executando método estático: {nome_funcao}")
-        logging.info(f"Argumentos: args={args}, kwargs={kwargs}")
+        logging.info(f"Executando: {nome_funcao}")
 
         inicio = time.time()
         try:
-            resultado = func(*args, **kwargs)
+            resultado = await func(*args, **kwargs)
             duracao = time.time() - inicio
-            logging.info(
-                f"Método {nome_funcao} finalizado com sucesso em {duracao:.4f}s"
-            )
+            logging.info(f"{nome_funcao} finalizado em {duracao:.4f}s")
             return resultado
         except Exception as e:
-            logging.error(f"Erro no método {nome_funcao}: {str(e)}")
-            raise e
+            logging.error(f"Erro em {nome_funcao}: {e}")
+            raise
 
     return wrapper

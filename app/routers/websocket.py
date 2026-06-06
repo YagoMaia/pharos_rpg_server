@@ -15,9 +15,15 @@ async def combat_endpoint(websocket: WebSocket, session_id: str):
     try:
         while True:
             data_text = await websocket.receive_text()
-            data_json = json.loads(data_text)
-
-            await game_logic.handle_message(session_id, data_json)
-
+            try:
+                data_json = json.loads(data_text)
+                await game_logic.handle_message(session_id, data_json)
+            except json.JSONDecodeError:
+                await websocket.send_json({"error": "Formato JSON inválido"})
+            except Exception as e:
+                print(f"Erro ao processar lógica: {e}")
+                await websocket.send_json(
+                    {"error": "Erro interno ao processar comando"}
+                )
     except WebSocketDisconnect:
         manager.disconnect(session_id, websocket)

@@ -5,8 +5,8 @@ description = "Backend server for a real-time RPG, built with FastAPI and WebSoc
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "aioredis>=2.0.1",
     "fastapi[standard]>=0.128.0",
+    "pydantic-settings>=2.0.0",
     "redis>=7.1.0",
     "uvicorn[standard]>=0.40.0",
     "websockets>=16.0",
