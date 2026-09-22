@@ -104,10 +104,25 @@ class PlayerService:
         """Muda postura e dispara evento Delta."""
         c_id = payload["combatantId"]
         s_id = payload["stanceId"]
-        new_ac = payload["newAC"]
         combatant = state.combatants.get(c_id)
 
         if combatant:
+            old_stance = next((s for s in combatant.stances if s.id == combatant.activeStanceId), None)
+            new_stance = next((s for s in combatant.stances if s.id == s_id), None)
+            if s_id is not None and (new_stance is None or not combatant.turnActions.bonus):
+                return
+            if any(c.name in {"Incapacitado", "Paralisado", "Atordoado"} for c in combatant.conditions):
+                return
+            if s_id == combatant.activeStanceId:
+                return
+
+            def armor_bonus(stance):
+                if not stance:
+                    return 0
+                attribute = combatant.attributes.get(stance.acAttribute)
+                return (stance.acBonus or 0) + (attribute.modifier if attribute else 0)
+
+            new_ac = combatant.armorClass - armor_bonus(old_stance) + armor_bonus(new_stance)
             if s_id is None:
                 log_msg = f"{combatant.name} assumiu a postura Neutra (CA {new_ac})."
                 combatant.activeStanceId = None
@@ -144,40 +159,55 @@ class PlayerService:
         """Avança turno e dispara evento Delta."""
         if not state.turn_order:
             return
-        state.turn_index = (state.turn_index + 1) % len(state.turn_order)
-        next_id = state.turn_order[state.turn_index]
-        next_actor = state.combatants.get(next_id)
-        if not next_actor:
-            return
 
         from app.managers.connection import manager
 
+        max_iterations = len(state.turn_order)
+        for _ in range(max_iterations):
+            if not state.turn_order:
+                continue
+            state.turn_index = (state.turn_index + 1) % len(state.turn_order)
+            next_id = state.turn_order[state.turn_index]
+            next_actor = state.combatants.get(next_id)
+
+            if not next_actor:
+                continue
+
+            if next_actor.hp.current <= 0:
+                if next_actor.type == "npc":
+                    if next_actor.currentPhaseIndex < len(next_actor.phases):
+                        state.logs.append(f"{next_actor.name} aguarda a próxima fase.")
+                        continue
+                    state.logs.append(f"💀 {next_actor.name} removido.")
+                    await GMService.remove_combatant(state, {"combatantId": next_actor.id})
+                    # A remoção deslocou o próximo ator para o índice atual.
+                    state.turn_index -= 1
+                    continue
+                if next_actor.type == "pet":
+                    state.logs.append(f"🐾 {next_actor.name} está inconsciente e pulou o turno.")
+                    continue
+                if (
+                    next_actor.deathSaves.failures >= 3
+                    or next_actor.deathSaves.successes >= 3
+                ):
+                    status = (
+                        "morto" if next_actor.deathSaves.failures >= 3 else "estabilizado"
+                    )
+                    state.logs.append(f"⚰️ {next_actor.name} está {status} e pulou o turno.")
+                    continue
+            break  # Combatente valido encontrado
+        else:
+            state.logs.append("💀 Todos os combatentes estão incapacitados.")
+            state.turn_index = -1
+            await manager.broadcast_event(state.session_id, "TURN_UPDATE", {
+                "newActiveId": None, "turnIndex": -1, "log": state.logs[-1],
+            })
+            return
+
         # Lógica de Inconsciência
         if next_actor.hp.current <= 0:
-            if next_actor.type == "npc":
-                state.logs.append(f"💀 {next_actor.name} removido.")
-                await GMService.remove_combatant(state, {"combatantId": next_actor.id})
-                await PlayerService.next_turn(state)
-                return
-
-            # Pets mortos pulam o turno automaticamente
-            if next_actor.type == "pet":
-                state.logs.append(f"🐾 {next_actor.name} está inconsciente e pulou o turno.")
-                await PlayerService.next_turn(state)
-                return
-
-            if (
-                next_actor.deathSaves.failures >= 3
-                or next_actor.deathSaves.successes >= 3
-            ):
-                status = (
-                    "morto" if next_actor.deathSaves.failures >= 3 else "estabilizado"
-                )
-                state.logs.append(f"⚰️ {next_actor.name} está {status} e pulou o turno.")
-                await PlayerService.next_turn(state)
-                return
-
             next_actor.turnActions.standard, next_actor.turnActions.bonus = True, False
+            next_actor.turnActions.reaction = False
             log_msg = f"🚑 --- Turno de {next_actor.name} (TESTE DE MORTE) ---"
         else:
             next_actor.turnActions.standard = True
@@ -198,6 +228,11 @@ class PlayerService:
                     expired_conditions.append(cond)
                     continue
             remaining_conditions.append(cond)
+
+        if any(c.name in {"Incapacitado", "Paralisado", "Atordoado"} for c in remaining_conditions):
+            next_actor.turnActions.standard = False
+            next_actor.turnActions.bonus = False
+            next_actor.turnActions.reaction = False
 
         if expired_conditions:
             next_actor.conditions = remaining_conditions
@@ -225,6 +260,7 @@ class PlayerService:
                 "turnIndex": state.turn_index,
                 "log": log_msg,
                 "turnActions": next_actor.turnActions.model_dump(),
+                "conditions": [c.model_dump() for c in next_actor.conditions],
             },
         )
 
@@ -236,6 +272,10 @@ class PlayerService:
         attacker = state.combatants.get(data.attackerId)
         if not attacker:
             return
+        if attacker.hp.current <= 0 or any(
+            c.name in {"Incapacitado", "Paralisado", "Atordoado"} for c in attacker.conditions
+        ):
+            return
 
         # Validação de Economia de Ações
         cost_attr = (
@@ -245,7 +285,7 @@ class PlayerService:
             if data.costType == "bonus"
             else "reaction"
         )
-        if not getattr(attacker.turnActions, cost_attr) and data.costType != "reaction":
+        if not getattr(attacker.turnActions, cost_attr):
             return
 
         if data.focusCost > attacker.focus.current:
@@ -469,6 +509,9 @@ class PlayerService:
         data = ApplyConditionPayload(**payload)
         combatant = state.combatants.get(data.combatantId)
         if not combatant:
+            return
+
+        if any(c.name == data.conditionName for c in combatant.conditions):
             return
 
         condition = ActiveCondition(

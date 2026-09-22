@@ -50,6 +50,7 @@ class GameLogic:
                 return
 
             # 4. Processamento da Lógica
+            previous_combatants = set(state.combatants)
             match event_type:
                 case "GM_CONNECT":
                     await GMService.gm_connect(state)
@@ -59,6 +60,8 @@ class GameLogic:
                     await GMService.add_npc(state, payload)
                 case "GM_REMOVE_COMBATANT":
                     await GMService.remove_combatant(state, payload)
+                case "GM_ADVANCE_PHASE":
+                    await GMService.advance_phase(state, payload)
                 case "END_COMBAT":
                     await GMService.end_combat(state)
                 case "JOIN_SESSION":
@@ -87,8 +90,9 @@ class GameLogic:
                     "END_COMBAT",
                     "GM_ADD_NPC",
                     "GM_REMOVE_COMBATANT",
+                    "GM_ADVANCE_PHASE",
                 ]
-                if event_type in structural_events:
+                if event_type in structural_events or previous_combatants != set(state.combatants):
                     # broadcast_state já faz set + publish
                     await self.manager.broadcast_state(session_id, state)
                 else:

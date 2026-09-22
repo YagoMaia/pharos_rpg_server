@@ -1,9 +1,39 @@
 from app.core.utils import static_method_log
-from app.models.domain import Combatant, CombatSession
+from app.models.domain import Combatant, CombatSession, DeathSaves
 from app.models.events import RemoveCombatantPayload
 
 
 class GMService:
+    @staticmethod
+    @static_method_log
+    async def advance_phase(state: CombatSession, payload: dict):
+        actor = state.combatants.get(payload.get("combatantId"))
+        if not actor or actor.type != "npc":
+            return
+        index = actor.currentPhaseIndex
+        # O índice esperado torna cliques repetidos idempotentes.
+        if payload.get("expectedPhaseIndex", index) != index or index >= len(actor.phases):
+            return
+        phase = actor.phases[index]
+        stance = next((s for s in actor.stances if s.id == actor.activeStanceId), None)
+        bonus = (stance.acBonus or 0) if stance else 0
+        if stance and stance.acAttribute:
+            attribute = actor.attributes.get(stance.acAttribute)
+            bonus += attribute.modifier if attribute else 0
+        actor.armorClass = phase.armorClass if phase.armorClass is not None else actor.armorClass - bonus
+        actor.activeStanceId = None
+        for field in ("name", "image", "stances", "skills", "weapons"):
+            value = getattr(phase, field)
+            if value is not None:
+                setattr(actor, field, value)
+        if phase.maxHp is not None:
+            actor.hp.max = phase.maxHp
+        actor.hp.current = actor.hp.max
+        actor.deathSaves = DeathSaves()
+        # Condições, foco e ações permanecem: mudar de fase não concede outro turno.
+        actor.currentPhaseIndex += 1
+        state.logs.append(f"{actor.name} avançou para a fase {actor.currentPhaseIndex + 1}.")
+
     @staticmethod
     @static_method_log
     async def add_npc(state: CombatSession, payload: dict):

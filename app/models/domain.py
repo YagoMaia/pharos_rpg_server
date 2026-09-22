@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 AttributeName = Literal[
     "Constituição", "Força", "Carisma", "Sabedoria", "Inteligência", "Destreza"
@@ -58,6 +58,7 @@ class Stance(BaseModel):
     maneuver: str
     recovery: Optional[str] = None
     acBonus: Optional[int] = 0
+    acAttribute: Optional[AttributeName] = None
 
 
 # --- SISTEMA DE CONDIÇÕES ---
@@ -107,6 +108,16 @@ class CombatWeaponData(BaseModel):
     range: str
 
 
+class NpcPhase(BaseModel):
+    name: Optional[str] = None
+    image: Optional[str] = None
+    maxHp: Optional[int] = Field(default=None, gt=0)
+    armorClass: Optional[int] = Field(default=None, ge=0)
+    stances: Optional[List[Stance]] = None
+    skills: Optional[List[Skill]] = None
+    weapons: Optional[Dict[str, CombatWeaponData]] = None
+
+
 class Combatant(BaseModel):
     model_config = {"extra": "ignore"}
 
@@ -136,6 +147,8 @@ class Combatant(BaseModel):
     spells: List[Spell] = []
 
     activeStanceId: Optional[str] = None
+    phases: List[NpcPhase] = Field(default_factory=list)
+    currentPhaseIndex: int = Field(default=0, ge=0)
 
     # Condições ativas (ex: Cego, Prostrado, Confuso)
     conditions: List[ActiveCondition] = []
