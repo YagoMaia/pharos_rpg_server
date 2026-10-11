@@ -56,14 +56,127 @@ class MemoryManager:
 
 
 class CombatRegressions(unittest.IsolatedAsyncioTestCase):
+    async def test_reconnect_updates_maxima_and_armor_without_restoring_combat_resources(self):
+        stance = dict(id="shot", name="Queima-Roupa", benefit="", restriction="", maneuver="", acAttribute="Constituição")
+        old = actor("hero", type="player", baseArmorClass=18, armorClass=23, stances=[stance], activeStanceId="shot",
+                    hp={"current": 8, "max": 20}, focus={"current": 2, "max": 10},
+                    deathSaves={"successes": 1, "failures": 1},
+                    conditions=[dict(id="poison", name="Envenenado", appliedAtTurn=0, sourceId="gm", description="")])
+        incoming = actor("hero", type="player", baseArmorClass=19, armorClass=19, stances=[stance],
+                         hp={"current": 27, "max": 27}, focus={"current": 12, "max": 12},
+                         attributes={"Constituição": {"name": "Constituição", "value": 18, "modifier": 4}})
+        state = session(old)
+        manager = MemoryManager(state)
+        with patch("app.managers.connection.manager", manager):
+            for _ in range(3):
+                await PlayerService.join_session(state, {"combatant": incoming.model_dump()})
+                self.assertEqual((old.hp.current, old.hp.max), (8, 27))
+                self.assertEqual((old.focus.current, old.focus.max), (2, 12))
+                self.assertEqual(old.armorClass, 25)  # base 19 + CON 4 + ajuste temporário 2
+                self.assertEqual(old.baseArmorClass, 19)
+                self.assertFalse(old.turnActions.standard)
+                self.assertFalse(old.turnActions.bonus)
+                self.assertFalse(old.turnActions.reaction)
+                self.assertEqual(old.deathSaves.failures, 1)
+                self.assertEqual(old.conditions[0].id, "poison")
+            # A postura continua removível sem subtrair o modificador antigo.
+            await PlayerService.change_stance(state, {"combatantId": "hero", "stanceId": None})
+            self.assertEqual(old.armorClass, 21)
+
+    async def test_reconnect_handles_removed_stances_lower_maxima_and_legacy_armor(self):
+        stance = dict(id="guard", name="Guarda", benefit="", restriction="", maneuver="", acBonus=2)
+        old = actor("hero", type="player", armorClass=20, stances=[stance], activeStanceId="guard",
+                    hp={"current": 27, "max": 27}, focus={"current": 8, "max": 10})
+        incoming = actor("hero", type="player", armorClass=15, stances=[], hp={"current": 20, "max": 20}, focus={"current": 6, "max": 6})
+        await PlayerService.join_session(session(old), {"combatant": incoming.model_dump()})
+        self.assertEqual((old.hp.current, old.hp.max), (20, 20))
+        self.assertEqual((old.focus.current, old.focus.max), (6, 6))
+        self.assertEqual(old.armorClass, 15)
+        self.assertEqual(old.baseArmorClass, 15)
+        self.assertIsNone(old.activeStanceId)
+        old.hp.current = 0
+        incoming.hp.max = 30
+        await PlayerService.join_session(session(old), {"combatant": incoming.model_dump()})
+        self.assertEqual(old.hp.current, 0)
+
+    async def test_reconnect_updates_pet_and_snapshot_preserves_damage_components(self):
+        player = actor("hero", type="player")
+        pet = actor("pet", type="pet", ownerId="hero", hp={"current": 3, "max": 20})
+        incoming_pet = actor("pet", type="pet", ownerId="hero", armorClass=15, hp={"current": 30, "max": 30})
+        player.weapons = actor("weapon", weapons={"melee": dict(name="Espada", damage="1d8", damageBonus=1,
+            damageIncludesAttribute=False, attribute="Força", attackBonus=0, range="1.5m")}).weapons
+        manager = MemoryManager(session(player, pet))
+        await GameLogic(manager).handle_message("room", {"type": "JOIN_SESSION", "payload": {
+            "combatant": player.model_dump(), "pet": incoming_pet.model_dump(),
+        }})
+        restored = await manager.get_state("room")
+        self.assertEqual((restored.combatants["pet"].hp.current, restored.combatants["pet"].hp.max), (3, 30))
+        self.assertEqual(restored.combatants["pet"].armorClass, 15)
+        weapon = manager.snapshots[-1]["combatants"]["hero"]["weapons"]["melee"]
+        self.assertEqual(weapon["damage"], "1d8")
+        self.assertEqual(weapon["damageBonus"], 1)
+        self.assertFalse(weapon["damageIncludesAttribute"])
+
+    async def test_bonus_and_reaction_actions_work_with_standard_action_spent(self):
+        for action in ("bonus", "reaction"):
+            for healing in (False, True):
+                attacker = actor("hero", type="player", turnActions={"standard": False, "bonus": True, "reaction": True})
+                target = actor("target", hp={"current": 8, "max": 20})
+                state = session(attacker, target)
+                manager = MemoryManager(state)
+                payload = dict(attackerId="hero", targetId="target", actionName="Teste", costType=action,
+                               focusCost=2, damageAmount=0 if healing else 5, healingAmount=5 if healing else 0)
+                with patch("app.managers.connection.manager", manager):
+                    await PlayerService.resolve_action(state, payload)
+                    self.assertEqual(target.hp.current, 13 if healing else 3)
+                    self.assertEqual(attacker.focus.current, 5)
+                    self.assertFalse(getattr(attacker.turnActions, action))
+                    self.assertFalse(attacker.turnActions.standard)
+                    self.assertTrue(getattr(attacker.turnActions, "bonus" if action == "reaction" else "reaction"))
+                    await PlayerService.resolve_action(state, payload)
+                    self.assertEqual(target.hp.current, 13 if healing else 3)
+                    self.assertEqual(attacker.focus.current, 5)
+
+    async def test_feats_survive_join_snapshot_and_reconnection_without_reapplying_bonuses(self):
+        feat = dict(id="vigoroso", name="Vigoroso", category="Geral", benefit="+1 CON e PV por nível",
+                    slotLevel=3, manualBenefits=False)
+        custom = dict(id="faction", name="Facção", category="Social", benefit="Efeito manual")
+        player = actor("hero", type="player", hp={"current": 20, "max": 27}, feats=[feat],
+                       factionFeat=custom, specialFeat={**custom, "id": "special"})
+        manager = MemoryManager(session())
+        engine = GameLogic(manager)
+        with patch("app.managers.connection.manager", manager):
+            await engine.handle_message("room", {"type": "JOIN_SESSION", "payload": {"combatant": player.model_dump()}})
+            restored = (await manager.get_state("room")).combatants["hero"]
+            self.assertEqual(restored.feats[0].slotLevel, 3)
+            self.assertFalse(restored.feats[0].manualBenefits)
+            self.assertEqual(restored.factionFeat.id, "faction")
+            self.assertEqual(restored.specialFeat.id, "special")
+            self.assertEqual(restored.hp.max, 27)
+            self.assertEqual(manager.snapshots[-1]["combatants"]["hero"]["feats"][0]["id"], "vigoroso")
+            await engine.handle_message("room", {"type": "MANUAL_UPDATE", "payload": {"combatantId": "hero", "newHp": 12}})
+            player.specialFeat = None
+            await engine.handle_message("room", {"type": "JOIN_SESSION", "payload": {"combatant": player.model_dump()}})
+            restored = (await manager.get_state("room")).combatants["hero"]
+            self.assertIsNone(restored.specialFeat)
+            self.assertEqual(restored.hp.current, 12)
+            self.assertEqual(restored.hp.max, 27)
+
     async def test_two_websocket_connections_do_not_lose_concurrent_updates(self):
         manager = MemoryManager(session(actor("a"), actor("b")))
 
         def socket(identifier, hp):
+            combatant = actor(identifier, type="player").model_dump()
             return Mock(
-                receive_text=AsyncMock(side_effect=[json.dumps({"type": "MANUAL_UPDATE", "payload": {
-                    "combatantId": identifier, "newHp": hp,
-                }}), WebSocketDisconnect()]),
+                receive_text=AsyncMock(side_effect=[
+                    json.dumps({"type": "JOIN_SESSION", "payload": {
+                        "clientId": f"client-{identifier}", "combatant": combatant,
+                    }}),
+                    json.dumps({"type": "MANUAL_UPDATE", "payload": {
+                        "clientId": f"client-{identifier}", "combatantId": identifier, "newHp": hp,
+                    }}),
+                    WebSocketDisconnect(),
+                ]),
                 send_json=AsyncMock(),
             )
 
@@ -104,6 +217,68 @@ class CombatRegressions(unittest.IsolatedAsyncioTestCase):
         await engine.handle_message("room", {**command, "payload": {"combatantId": "boss", "expectedPhaseIndex": 1}})
         await engine.handle_message("room", {**command, "payload": {"combatantId": "boss", "expectedPhaseIndex": 2}})
         self.assertEqual((await manager.get_state("room")).combatants["boss"].currentPhaseIndex, 2)
+
+    async def test_authorization_locks_gm_and_combatant_ownership(self):
+        hero = actor("hero", type="player", turnActions={"standard": True, "bonus": True, "reaction": True})
+        other = actor("other", type="player")
+        state = session(hero, other)
+        manager = MemoryManager(state)
+        engine = GameLogic(manager)
+
+        gm_identity = {"client_id": None, "role": None, "player_id": None}
+        await engine.handle_message("room", {"type": "GM_CONNECT", "payload": {"clientId": "gm-1"}}, gm_identity)
+        self.assertEqual(gm_identity["role"], "gm")
+
+        with self.assertRaisesRegex(ValueError, "Apenas o GM"):
+            await engine.handle_message(
+                "room",
+                {"type": "GM_ADD_NPC", "payload": {"clientId": "gm-2", **actor("npc").model_dump()}},
+                {"client_id": None, "role": None, "player_id": None},
+            )
+
+        player_identity = {"client_id": None, "role": None, "player_id": None}
+        await engine.handle_message("room", {"type": "JOIN_SESSION", "payload": {
+            "clientId": "player-1", "combatant": hero.model_dump(),
+        }}, player_identity)
+        self.assertEqual(player_identity["player_id"], "hero")
+
+        with self.assertRaisesRegex(ValueError, "outro usuário"):
+            await engine.handle_message("room", {"type": "JOIN_SESSION", "payload": {
+                "clientId": "player-2", "combatant": hero.model_dump(),
+            }}, {"client_id": None, "role": None, "player_id": None})
+
+        await engine.handle_message("room", {"type": "CHANGE_STANCE", "payload": {
+            "clientId": "player-1", "combatantId": "hero", "stanceId": None,
+        }}, player_identity)
+
+        with self.assertRaisesRegex(ValueError, "seu personagem"):
+            await engine.handle_message("room", {"type": "MANUAL_UPDATE", "payload": {
+                "clientId": "player-1", "combatantId": "other", "newHp": 1,
+            }}, player_identity)
+
+    async def test_authorization_allows_owned_pet_and_current_turn_only(self):
+        hero = actor("hero", type="player")
+        pet = actor("pet", type="pet", ownerId="hero")
+        other = actor("other", type="player")
+        state = session(hero, pet, other)
+        state.turn_index = 0
+        manager = MemoryManager(state)
+        engine = GameLogic(manager)
+        identity = {"client_id": None, "role": None, "player_id": None}
+
+        await engine.handle_message("room", {"type": "JOIN_SESSION", "payload": {
+            "clientId": "player-1", "combatant": hero.model_dump(), "pet": pet.model_dump(),
+        }}, identity)
+        await engine.handle_message("room", {"type": "MANUAL_UPDATE", "payload": {
+            "clientId": "player-1", "combatantId": "pet", "newHp": 9,
+        }}, identity)
+        self.assertEqual((await manager.get_state("room")).combatants["pet"].hp.current, 9)
+
+        state = await manager.get_state("room")
+        state.turn_index = state.turn_order.index("other")
+        manager.raw = state.model_dump_json()
+        with self.assertRaisesRegex(ValueError, "turno atual"):
+            await engine.handle_message("room", {"type": "END_TURN", "payload": {"clientId": "player-1"}}, identity)
 
     async def test_turn_skips_dead_npc_without_skipping_next_and_keeps_pending_boss(self):
         state = session(actor("a"), actor("dead", hp={"current": 0, "max": 20}),

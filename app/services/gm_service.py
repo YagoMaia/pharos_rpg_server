@@ -22,6 +22,7 @@ class GMService:
             bonus += attribute.modifier if attribute else 0
         actor.armorClass = phase.armorClass if phase.armorClass is not None else actor.armorClass - bonus
         actor.activeStanceId = None
+        actor.baseArmorClass = actor.armorClass
         for field in ("name", "image", "stances", "skills", "weapons"):
             value = getattr(phase, field)
             if value is not None:
@@ -118,6 +119,7 @@ class GMService:
 
         # 3. Remove dos dados
         del state.combatants[c_id]
+        state.combatantOwners.pop(c_id, None)
         if c_id in state.turn_order:
             state.turn_order.remove(c_id)
 
@@ -151,6 +153,9 @@ class GMService:
         # 3. Limpar NPCs da memória (Combatants)
         # Cria um novo dict apenas com os players
         state.combatants = {p_id: state.combatants[p_id] for p_id in player_ids}
+        state.combatantOwners = {
+            p_id: owner for p_id, owner in state.combatantOwners.items() if p_id in player_ids
+        }
 
         # 4. Limpar a Ordem de Turno
         # Opção A: Zera tudo (Ninguém tem turno)

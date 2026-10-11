@@ -13,6 +13,38 @@ from app.services.gm_service import GMService
 
 class PlayerService:
     @staticmethod
+    def _sync_sheet(existing: Combatant, incoming: Combatant):
+        """Sincroniza a ficha sem restaurar recursos, ações ou testes de morte."""
+        def stance_bonus(actor):
+            stance = next((s for s in actor.stances if s.id == actor.activeStanceId), None)
+            if not stance:
+                return 0
+            attribute = actor.attributes.get(stance.acAttribute)
+            return (stance.acBonus or 0) + (attribute.modifier if attribute else 0)
+
+        old_bonus = stance_bonus(existing)
+        old_base = existing.baseArmorClass
+        if old_base is None:
+            old_base = existing.armorClass - old_bonus
+        # Preserva ajustes temporários de combate separados da ficha e da postura.
+        temporary_ac = existing.armorClass - old_base - old_bonus
+        new_base = incoming.baseArmorClass
+        if new_base is None:
+            new_base = incoming.armorClass - stance_bonus(incoming)
+
+        for field in ("attributes", "stances", "skills", "spells", "weapons", "image",
+                      "feats", "factionFeat", "specialFeat"):
+            setattr(existing, field, getattr(incoming, field))
+        if not any(s.id == existing.activeStanceId for s in existing.stances):
+            existing.activeStanceId = None
+        existing.baseArmorClass = new_base
+        existing.armorClass = new_base + stance_bonus(existing) + temporary_ac
+        existing.hp.max = max(1, incoming.hp.max)
+        existing.hp.current = min(existing.hp.current, existing.hp.max)
+        existing.focus.max = max(0, incoming.focus.max)
+        existing.focus.current = min(existing.focus.current, existing.focus.max)
+
+    @staticmethod
     @static_method_log
     async def join_session(state: CombatSession, payload: dict):
         """Adiciona ou sincroniza um jogador na sessão. Se tiver pet, adiciona também."""
@@ -24,14 +56,7 @@ class PlayerService:
 
         if new_combatant.id in state.combatants:
             existing = state.combatants[new_combatant.id]
-            # RECONEXÃO: Apenas atualiza dados "estruturais" da ficha.
-            # Preserva HP, Focus, DeathSaves, TurnActions, ActiveStance, ArmorClass
-            # que são o estado VIVO do combate no servidor.
-            existing.attributes = new_combatant.attributes
-            existing.skills = new_combatant.skills
-            existing.spells = new_combatant.spells
-            existing.weapons = new_combatant.weapons
-            existing.image = new_combatant.image
+            PlayerService._sync_sheet(existing, new_combatant)
             state.logs.append(f"{new_combatant.name} reconectou.")
         else:
             state.combatants[new_combatant.id] = new_combatant
@@ -46,12 +71,7 @@ class PlayerService:
 
             if pet_combatant.id in state.combatants:
                 existing_pet = state.combatants[pet_combatant.id]
-                # RECONEXÃO PET: Preserva estado de combate, atualiza estruturais
-                existing_pet.attributes = pet_combatant.attributes
-                existing_pet.skills = pet_combatant.skills
-                existing_pet.spells = pet_combatant.spells
-                existing_pet.weapons = pet_combatant.weapons
-                existing_pet.image = pet_combatant.image
+                PlayerService._sync_sheet(existing_pet, pet_combatant)
                 state.logs.append(f"🐾 {pet_combatant.name} reconectou.")
             else:
                 state.combatants[pet_combatant.id] = pet_combatant
@@ -429,9 +449,6 @@ class PlayerService:
         """Aplica condições embutidas em um RESOLVE_ACTION. Retorna logs."""
         if not data.appliedConditions:
             return []
-
-        from app.managers.connection import manager
-        import asyncio
 
         logs = []
         for cp in data.appliedConditions:

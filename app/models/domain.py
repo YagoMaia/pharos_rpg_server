@@ -106,6 +106,8 @@ class CombatWeaponData(BaseModel):
     attribute: AttributeName
     attackBonus: int
     range: str
+    damageBonus: int = 0
+    damageIncludesAttribute: Optional[bool] = None
 
 
 class NpcPhase(BaseModel):
@@ -118,6 +120,18 @@ class NpcPhase(BaseModel):
     weapons: Optional[Dict[str, CombatWeaponData]] = None
 
 
+class CombatFeat(BaseModel):
+    id: str
+    name: str
+    category: str
+    benefit: str
+    objective: Optional[str] = None
+    prerequisite: Optional[str] = None
+    slotLevel: Optional[int] = None
+    attributeChoices: Optional[List[AttributeName]] = None
+    manualBenefits: Optional[bool] = None
+
+
 class Combatant(BaseModel):
     model_config = {"extra": "ignore"}
 
@@ -125,6 +139,9 @@ class Combatant(BaseModel):
     name: str
     baseName: Optional[str] = None
     image: Optional[str] = None
+    feats: List[CombatFeat] = Field(default_factory=list)
+    factionFeat: Optional[CombatFeat] = None
+    specialFeat: Optional[CombatFeat] = None
 
     initiative: int
     hp: StatsPair
@@ -133,6 +150,7 @@ class Combatant(BaseModel):
     ownerId: Optional[str] = None  # ID do player dono (para pets)
 
     armorClass: int
+    baseArmorClass: Optional[int] = None
     speed: Optional[str] = None
 
     attributes: Dict[str, Attribute] = {}
@@ -166,3 +184,5 @@ class CombatSession(BaseModel):
     combatants: Dict[str, Combatant]
     logs: List[str] = []
     last_event: Optional[dict] = None
+    gmClientId: Optional[str] = None
+    combatantOwners: Dict[str, str] = Field(default_factory=dict)

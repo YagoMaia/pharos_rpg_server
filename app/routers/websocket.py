@@ -12,6 +12,7 @@ _MAX_MESSAGES_PER_SECOND = 10
 @router.websocket('/ws/{session_id}')
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await manager.connect(session_id, websocket)
+    identity = {'role': None, 'client_id': None, 'player_id': None}
 
     # Estado de rate limiting por conexao (sliding window)
     msg_count = 0
@@ -40,7 +41,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     await websocket.send_text('{"type": "PONG"}')
                     continue
 
-                await game_logic.handle_message(session_id, data_json)
+                try:
+                    await game_logic.handle_message(session_id, data_json, identity)
+                except ValueError as e:
+                    await websocket.send_json({'error': str(e)})
             except json.JSONDecodeError:
                 await websocket.send_json({'error': 'Formato JSON invalido'})
             except Exception as e:
