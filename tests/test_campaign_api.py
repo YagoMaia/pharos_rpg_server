@@ -368,3 +368,22 @@ class CampaignApiTests(unittest.TestCase):
             ).status_code,
             404,
         )
+
+    def test_logout_revokes_only_the_current_token(self):
+        first = self.register("gm@example.com")
+        second_response = self.client.post(
+            "/auth/login",
+            json={
+                "email": "gm@example.com",
+                "password": "safe-password-123",
+            },
+        )
+        second = {"Authorization": f"Bearer {second_response.json()['accessToken']}"}
+        self.assertEqual(self.client.post("/auth/logout").status_code, 401)
+        logged_out = self.client.post("/auth/logout", headers=first)
+        self.assertEqual(logged_out.status_code, 204, logged_out.text)
+        self.assertEqual(self.client.get("/campaigns", headers=first).status_code, 401)
+        self.assertEqual(self.client.get("/campaigns", headers=second).status_code, 200)
+        self.assertEqual(
+            self.client.post("/auth/logout", headers=first).status_code, 401
+        )

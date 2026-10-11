@@ -123,6 +123,13 @@ class CampaignStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def revoke_token(self, user_id: str, token: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "DELETE FROM tokens WHERE hash = ? AND user_id = ?",
+                (_digest(token), user_id),
+            )
+
     @staticmethod
     def _summary(row: sqlite3.Row) -> dict:
         return {

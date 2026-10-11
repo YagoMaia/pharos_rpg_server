@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -85,6 +85,18 @@ def register(body: RegisterBody, store: Store):
 @router.post("/auth/login")
 def login(body: LoginBody, store: Store):
     return {"accessToken": store.login(body.email, body.password)}
+
+
+@router.post("/auth/logout", status_code=204)
+def logout(
+    user: User,
+    store: Store,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+):
+    if not credentials:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Autenticação necessária.")
+    store.revoke_token(user["id"], credentials.credentials)
+    return Response(status_code=204)
 
 
 @router.post("/campaigns", status_code=201)
