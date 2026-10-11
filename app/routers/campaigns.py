@@ -1,7 +1,7 @@
 """API de campanhas: autenticada, separada da sala de combate WebSocket."""
 
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -66,6 +66,13 @@ class CharacterBody(BaseModel):
     characterId: str = Field(min_length=1, max_length=128)
 
 
+class JournalEntryBody(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    title: str = Field(min_length=1, max_length=120)
+    body: str = Field(min_length=1, max_length=10000)
+    visibility: Literal["gm", "party"]
+
+
 Store = Annotated[CampaignStore, Depends(get_campaign_store)]
 User = Annotated[dict, Depends(current_user)]
 
@@ -108,3 +115,24 @@ def create_invite(campaign_id: str, user: User, store: Store):
 @router.put("/campaigns/{campaign_id}/character")
 def link_character(campaign_id: str, body: CharacterBody, user: User, store: Store):
     return store.link_character(user["id"], campaign_id, body.characterId)
+
+
+@router.get("/campaigns/{campaign_id}/entries")
+def list_entries(campaign_id: str, user: User, store: Store):
+    return store.list_entries(user["id"], campaign_id)
+
+
+@router.post("/campaigns/{campaign_id}/entries", status_code=201)
+def create_entry(campaign_id: str, body: JournalEntryBody, user: User, store: Store):
+    return store.create_entry(
+        user["id"], campaign_id, body.title, body.body, body.visibility
+    )
+
+
+@router.put("/campaigns/{campaign_id}/entries/{entry_id}")
+def update_entry(
+    campaign_id: str, entry_id: str, body: JournalEntryBody, user: User, store: Store
+):
+    return store.update_entry(
+        user["id"], campaign_id, entry_id, body.title, body.body, body.visibility
+    )

@@ -269,3 +269,102 @@ class CampaignApiTests(unittest.TestCase):
             ).status_code,
             200,
         )
+
+    def test_journal_visibility_and_access_are_enforced_by_server(self):
+        gm = self.register("gm@example.com", "Mestre")
+        player = self.register("player@example.com", "Jogador")
+        outsider = self.register("outsider@example.com", "Estranho")
+        campaign_id = self.campaign(gm)["id"]
+        code = self.invite(gm, campaign_id)["code"]
+        self.client.post("/campaigns/join", headers=player, json={"inviteCode": code})
+        url = f"/campaigns/{campaign_id}/entries"
+
+        secret = self.client.post(
+            url,
+            headers=gm,
+            json={
+                "title": "Segredo",
+                "body": "Revelação escondida",
+                "visibility": "gm",
+            },
+        )
+        self.assertEqual(secret.status_code, 201, secret.text)
+        public = self.client.post(
+            url,
+            headers=gm,
+            json={
+                "title": "Recapitulação",
+                "body": "O grupo chegou à cidade",
+                "visibility": "party",
+            },
+        )
+        self.assertEqual(public.status_code, 201, public.text)
+        self.assertEqual(secret.json()["visibility"], "gm")
+        self.assertIn("createdAt", public.json())
+        self.assertEqual(len(self.client.get(url, headers=gm).json()), 2)
+        player_entries = self.client.get(url, headers=player).json()
+        self.assertEqual(
+            [entry["title"] for entry in player_entries], ["Recapitulação"]
+        )
+        self.assertNotIn("Revelação escondida", str(player_entries))
+        self.assertEqual(self.client.get(url, headers=outsider).status_code, 403)
+        self.assertEqual(self.client.get(url).status_code, 401)
+        self.assertEqual(
+            self.client.post(
+                url,
+                headers=player,
+                json={
+                    "title": "Outro",
+                    "body": "Tentativa",
+                    "visibility": "gm",
+                },
+            ).status_code,
+            403,
+        )
+
+    def test_journal_edit_restricts_role_and_visibility_changes(self):
+        gm = self.register("gm@example.com")
+        player = self.register("player@example.com")
+        campaign_id = self.campaign(gm)["id"]
+        code = self.invite(gm, campaign_id)["code"]
+        self.client.post("/campaigns/join", headers=player, json={"inviteCode": code})
+        url = f"/campaigns/{campaign_id}/entries"
+        entry = self.client.post(
+            url,
+            headers=gm,
+            json={
+                "title": "Nota",
+                "body": "Segredo",
+                "visibility": "gm",
+            },
+        ).json()
+        edit_url = f"{url}/{entry['id']}"
+        changes = {"title": "Resumo", "body": "Revelado", "visibility": "party"}
+        self.assertEqual(
+            self.client.put(edit_url, headers=player, json=changes).status_code, 403
+        )
+        self.assertEqual(
+            self.client.put(
+                edit_url,
+                headers=gm,
+                json={"title": "  ", "body": "x", "visibility": "party"},
+            ).status_code,
+            422,
+        )
+        edited = self.client.put(edit_url, headers=gm, json=changes)
+        self.assertEqual(edited.status_code, 200, edited.text)
+        self.assertEqual(
+            self.client.get(url, headers=player).json()[0]["body"], "Revelado"
+        )
+        self.assertEqual(
+            self.client.put(f"{url}/missing", headers=gm, json=changes).status_code, 404
+        )
+        other_campaign_id = self.campaign(gm)["id"]
+        self.assertEqual(
+            self.client.put(
+                f"/campaigns/{other_campaign_id}/entries/{entry['id']}",
+                headers=gm,
+                json=changes,
+            ).status_code,
+            404,
+        )

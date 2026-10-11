@@ -53,6 +53,15 @@ class CampaignStore:
                     hash TEXT PRIMARY KEY, campaign_id TEXT NOT NULL REFERENCES campaigns(id),
                     expires_at INTEGER NOT NULL, used_at INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS journal_entries (
+                    id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    title TEXT NOT NULL, body TEXT NOT NULL,
+                    visibility TEXT NOT NULL CHECK (visibility IN ('gm', 'party')),
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS journal_campaign_recent
+                    ON journal_entries(campaign_id, created_at DESC);
             """)
 
     def _connect(self) -> sqlite3.Connection:
@@ -247,3 +256,68 @@ class CampaignStore:
                     409, "Personagem já vinculado nesta campanha."
                 ) from exc
             return self._summary(self._member(conn, campaign_id, user_id))
+
+    @staticmethod
+    def _entry(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "title": row["title"],
+            "body": row["body"],
+            "visibility": row["visibility"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def create_entry(
+        self, user_id: str, campaign_id: str, title: str, body: str, visibility: str
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode criar notas.")
+            entry_id = str(uuid4())
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """INSERT INTO journal_entries VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (entry_id, campaign_id, title, body, visibility, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM journal_entries WHERE id = ?", (entry_id,)
+            ).fetchone()
+            return self._entry(row)
+
+    def list_entries(self, user_id: str, campaign_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            role = self._member(conn, campaign_id, user_id)["role"]
+            rows = conn.execute(
+                """SELECT * FROM journal_entries
+                WHERE campaign_id = ? AND (visibility = 'party' OR ? = 'gm')
+                ORDER BY created_at DESC, id DESC LIMIT 100""",
+                (campaign_id, role),
+            ).fetchall()
+            return [self._entry(row) for row in rows]
+
+    def update_entry(
+        self,
+        user_id: str,
+        campaign_id: str,
+        entry_id: str,
+        title: str,
+        body: str,
+        visibility: str,
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode editar notas.")
+            now = datetime.now(timezone.utc).isoformat()
+            updated = conn.execute(
+                """UPDATE journal_entries
+                SET title = ?, body = ?, visibility = ?, updated_at = ?
+                WHERE id = ? AND campaign_id = ?""",
+                (title, body, visibility, now, entry_id, campaign_id),
+            )
+            if updated.rowcount == 0:
+                raise CampaignError(404, "Nota não encontrada.")
+            row = conn.execute(
+                "SELECT * FROM journal_entries WHERE id = ?", (entry_id,)
+            ).fetchone()
+            return self._entry(row)
