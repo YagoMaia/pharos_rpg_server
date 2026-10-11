@@ -1,8 +1,10 @@
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import websocket
+from app.routers import campaigns, websocket
+from app.services.campaign_store import CampaignError
 
 app = FastAPI(title="RPG Server")
 
@@ -15,6 +17,12 @@ app.add_middleware(
 )
 
 app.include_router(websocket.router)
+app.include_router(campaigns.router)
+
+
+@app.exception_handler(CampaignError)
+async def campaign_error(_request: Request, error: CampaignError):
+    return JSONResponse(status_code=error.status, content={"detail": str(error)})
 
 
 @app.get("/")
