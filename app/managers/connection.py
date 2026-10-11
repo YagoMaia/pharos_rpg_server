@@ -15,9 +15,10 @@ class ConnectionManager:
         self.pubsub_tasks: dict[str, asyncio.Task] = {}
         self.subscription_ready: dict[str, asyncio.Event] = {}
 
-    async def connect(self, session_id: str, websocket: WebSocket):
+    async def connect(self, session_id: str, websocket: WebSocket, already_accepted: bool = False):
         session_id = session_id.lower()
-        await websocket.accept()
+        if not already_accepted:
+            await websocket.accept()
         if session_id not in self.active_connections:
             self.active_connections[session_id] = []
         self.active_connections[session_id].append(websocket)

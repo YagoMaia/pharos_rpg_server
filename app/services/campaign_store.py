@@ -130,6 +130,22 @@ class CampaignStore:
                 (_digest(token), user_id),
             )
 
+    def combat_member(self, token: str, campaign_id: str) -> dict:
+        user = self.user_for_token(token)
+        if not user:
+            raise CampaignError(401, "Sessão inválida.")
+        with closing(self._connect()) as conn:
+            member = self._member(conn, campaign_id, user["id"])
+            if member["role"] == "player" and not member["character_id"]:
+                raise CampaignError(
+                    403, "Vincule sua ficha antes de entrar no combate."
+                )
+            return {
+                "user_id": user["id"],
+                "role": member["role"],
+                "character_id": member["character_id"],
+            }
+
     @staticmethod
     def _summary(row: sqlite3.Row) -> dict:
         return {

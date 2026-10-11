@@ -40,6 +40,14 @@ class GameLogic:
     def _owned_by_client(self, state: CombatSession, combatant_id: str, client_id: str) -> bool:
         return state.combatantOwners.get(combatant_id) == client_id
 
+    @staticmethod
+    def _authorize_sheet(state: CombatSession, actor_id: str, identity: dict):
+        actor = state.combatants.get(actor_id)
+        if actor and actor.type == "pet":
+            actor = state.combatants.get(actor.ownerId)
+        if not actor or actor.sheetId != identity["character_id"]:
+            raise AuthorizationError("A ficha vinculada não controla este personagem.")
+
     def _authorize_gm(self, state: CombatSession, client_id: str, identity: dict):
         if state.gmClientId is None:
             state.gmClientId = client_id
@@ -84,14 +92,41 @@ class GameLogic:
             active_id = state.turn_order[state.turn_index]
             if not self._owned_by_client(state, active_id, client_id):
                 raise AuthorizationError("Apenas o dono do turno atual ou o GM pode encerrar o turno.")
+            if identity.get("authenticated"):
+                self._authorize_sheet(state, active_id, identity)
             return
 
         actor_id = payload.get("attackerId") or payload.get("combatantId")
         if not actor_id or not self._owned_by_client(state, actor_id, client_id):
             raise AuthorizationError("Você só pode comandar seu personagem ou pet.")
+        if identity.get("authenticated"):
+            self._authorize_sheet(state, actor_id, identity)
 
     def _authorize(self, state: CombatSession, event_type: str, payload: dict, identity: dict | None):
         if identity is None:
+            return
+
+        if identity.get("authenticated"):
+            client_id = identity["client_id"]
+            if event_type in GM_EVENTS:
+                if identity["role"] != "gm":
+                    raise AuthorizationError("Apenas o mestre da campanha pode executar este comando.")
+                self._authorize_gm(state, client_id, identity)
+                return
+            if event_type == "JOIN_SESSION":
+                combatant = payload.get("combatant") if isinstance(payload, dict) else None
+                if identity["role"] != "player" or not isinstance(combatant, dict):
+                    raise AuthorizationError("Apenas jogadores vinculados podem entrar no combate.")
+                if combatant.get("type") != "player" or combatant.get("sheetId") != identity["character_id"]:
+                    raise AuthorizationError("A ficha enviada não corresponde à ficha vinculada.")
+                existing = state.combatants.get(combatant.get("id"))
+                if existing and existing.type != "player":
+                    raise AuthorizationError("Este ID de personagem já está em uso.")
+                if existing and existing.sheetId != identity["character_id"]:
+                    raise AuthorizationError("A ficha vinculada não corresponde ao personagem existente.")
+                self._authorize_join(state, payload, client_id, identity)
+                return
+            self._authorize_player_command(state, event_type, payload or {}, identity)
             return
 
         client_id = None

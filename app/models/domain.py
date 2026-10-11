@@ -136,6 +136,7 @@ class Combatant(BaseModel):
     model_config = {"extra": "ignore"}
 
     id: str
+    sheetId: Optional[str] = None
     name: str
     baseName: Optional[str] = None
     image: Optional[str] = None
