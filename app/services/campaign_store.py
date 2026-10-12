@@ -106,6 +106,35 @@ class CampaignStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_quests_campaign
                     ON campaign_quests(campaign_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS campaign_encounters (
+                    id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    tactics TEXT NOT NULL DEFAULT '',
+                    rewards TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL CHECK (status IN ('planned', 'ready', 'completed')),
+                    monsters_data TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_encounters_campaign
+                    ON campaign_encounters(campaign_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS campaign_npcs (
+                    id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    name TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT '',
+                    attitude TEXT NOT NULL DEFAULT 'neutral' CHECK (attitude IN ('friendly', 'neutral', 'hostile', 'unknown')),
+                    description TEXT NOT NULL DEFAULT '',
+                    gm_notes TEXT NOT NULL DEFAULT '',
+                    combat_data TEXT,
+                    visibility TEXT NOT NULL CHECK (visibility IN ('party', 'gm')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_npcs_campaign
+                    ON campaign_npcs(campaign_id, created_at DESC);
             """)
             # Migration segura para character_data em bases SQLite já criadas
             cols = [row["name"] for row in conn.execute("PRAGMA table_info(members)").fetchall()]
@@ -702,4 +731,277 @@ class CampaignStore:
             )
             if deleted.rowcount == 0:
                 raise CampaignError(404, "Missão não encontrada.")
+
+    # --- ENCOUNTERS ---
+    @staticmethod
+    def _encounter(row: sqlite3.Row) -> dict:
+        monsters = []
+        if row["monsters_data"]:
+            try:
+                monsters = json.loads(row["monsters_data"])
+            except Exception:
+                monsters = []
+        return {
+            "id": row["id"],
+            "campaignId": row["campaign_id"],
+            "name": row["name"],
+            "description": row["description"],
+            "tactics": row["tactics"],
+            "rewards": row["rewards"],
+            "status": row["status"],
+            "monstersData": monsters,
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def list_encounters(self, user_id: str, campaign_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode acessar encontros.")
+            rows = conn.execute(
+                """SELECT * FROM campaign_encounters
+                WHERE campaign_id = ?
+                ORDER BY created_at DESC, id DESC""",
+                (campaign_id,),
+            ).fetchall()
+            return [self._encounter(row) for row in rows]
+
+    def get_encounter(self, user_id: str, campaign_id: str, encounter_id: str) -> dict:
+        with closing(self._connect()) as conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode acessar encontros.")
+            row = conn.execute(
+                "SELECT * FROM campaign_encounters WHERE id = ? AND campaign_id = ?",
+                (encounter_id, campaign_id),
+            ).fetchone()
+            if not row:
+                raise CampaignError(404, "Encontro não encontrado.")
+            return self._encounter(row)
+
+    def create_encounter(
+        self,
+        user_id: str,
+        campaign_id: str,
+        name: str,
+        description: str = "",
+        tactics: str = "",
+        rewards: str = "",
+        status: str = "planned",
+        monsters_data: list | None = None,
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode criar encontros.")
+            encounter_id = str(uuid4())
+            now = datetime.now(timezone.utc).isoformat()
+            monsters_json = json.dumps(monsters_data or [])
+            conn.execute(
+                """INSERT INTO campaign_encounters VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    encounter_id,
+                    campaign_id,
+                    name.strip(),
+                    description.strip(),
+                    tactics.strip(),
+                    rewards.strip(),
+                    status,
+                    monsters_json,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM campaign_encounters WHERE id = ?", (encounter_id,)
+            ).fetchone()
+            return self._encounter(row)
+
+    def update_encounter(
+        self,
+        user_id: str,
+        campaign_id: str,
+        encounter_id: str,
+        name: str,
+        description: str = "",
+        tactics: str = "",
+        rewards: str = "",
+        status: str = "planned",
+        monsters_data: list | None = None,
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode editar encontros.")
+            now = datetime.now(timezone.utc).isoformat()
+            monsters_json = json.dumps(monsters_data or [])
+            updated = conn.execute(
+                """UPDATE campaign_encounters
+                SET name = ?, description = ?, tactics = ?, rewards = ?, status = ?, monsters_data = ?, updated_at = ?
+                WHERE id = ? AND campaign_id = ?""",
+                (
+                    name.strip(),
+                    description.strip(),
+                    tactics.strip(),
+                    rewards.strip(),
+                    status,
+                    monsters_json,
+                    now,
+                    encounter_id,
+                    campaign_id,
+                ),
+            )
+            if updated.rowcount == 0:
+                raise CampaignError(404, "Encontro não encontrado.")
+            row = conn.execute(
+                "SELECT * FROM campaign_encounters WHERE id = ?", (encounter_id,)
+            ).fetchone()
+            return self._encounter(row)
+
+    def delete_encounter(self, user_id: str, campaign_id: str, encounter_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode excluir encontros.")
+            deleted = conn.execute(
+                "DELETE FROM campaign_encounters WHERE id = ? AND campaign_id = ?",
+                (encounter_id, campaign_id),
+            )
+            if deleted.rowcount == 0:
+                raise CampaignError(404, "Encontro não encontrado.")
+
+    # --- NPCS ---
+    @staticmethod
+    def _npc(row: sqlite3.Row, is_gm: bool) -> dict:
+        combat = None
+        if row["combat_data"]:
+            try:
+                combat = json.loads(row["combat_data"])
+            except Exception:
+                combat = None
+        data = {
+            "id": row["id"],
+            "campaignId": row["campaign_id"],
+            "name": row["name"],
+            "role": row["role"],
+            "attitude": row["attitude"],
+            "description": row["description"],
+            "combatData": combat,
+            "visibility": row["visibility"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+        if is_gm:
+            data["gmNotes"] = row["gm_notes"]
+        return data
+
+    def list_npcs(self, user_id: str, campaign_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            role = self._member(conn, campaign_id, user_id)["role"]
+            is_gm = role == "gm"
+            if is_gm:
+                rows = conn.execute(
+                    """SELECT * FROM campaign_npcs
+                    WHERE campaign_id = ?
+                    ORDER BY created_at DESC, id DESC""",
+                    (campaign_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM campaign_npcs
+                    WHERE campaign_id = ? AND visibility = 'party'
+                    ORDER BY created_at DESC, id DESC""",
+                    (campaign_id,),
+                ).fetchall()
+            return [self._npc(row, is_gm) for row in rows]
+
+    def create_npc(
+        self,
+        user_id: str,
+        campaign_id: str,
+        name: str,
+        role: str = "",
+        attitude: str = "neutral",
+        description: str = "",
+        gm_notes: str = "",
+        combat_data: dict | None = None,
+        visibility: str = "party",
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode criar NPCs.")
+            npc_id = str(uuid4())
+            now = datetime.now(timezone.utc).isoformat()
+            combat_json = json.dumps(combat_data) if combat_data else None
+            conn.execute(
+                """INSERT INTO campaign_npcs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    npc_id,
+                    campaign_id,
+                    name.strip(),
+                    role.strip(),
+                    attitude,
+                    description.strip(),
+                    gm_notes.strip(),
+                    combat_json,
+                    visibility,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM campaign_npcs WHERE id = ?", (npc_id,)
+            ).fetchone()
+            return self._npc(row, is_gm=True)
+
+    def update_npc(
+        self,
+        user_id: str,
+        campaign_id: str,
+        npc_id: str,
+        name: str,
+        role: str = "",
+        attitude: str = "neutral",
+        description: str = "",
+        gm_notes: str = "",
+        combat_data: dict | None = None,
+        visibility: str = "party",
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode editar NPCs.")
+            now = datetime.now(timezone.utc).isoformat()
+            combat_json = json.dumps(combat_data) if combat_data else None
+            updated = conn.execute(
+                """UPDATE campaign_npcs
+                SET name = ?, role = ?, attitude = ?, description = ?, gm_notes = ?,
+                    combat_data = ?, visibility = ?, updated_at = ?
+                WHERE id = ? AND campaign_id = ?""",
+                (
+                    name.strip(),
+                    role.strip(),
+                    attitude,
+                    description.strip(),
+                    gm_notes.strip(),
+                    combat_json,
+                    visibility,
+                    now,
+                    npc_id,
+                    campaign_id,
+                ),
+            )
+            if updated.rowcount == 0:
+                raise CampaignError(404, "NPC não encontrado.")
+            row = conn.execute(
+                "SELECT * FROM campaign_npcs WHERE id = ?", (npc_id,)
+            ).fetchone()
+            return self._npc(row, is_gm=True)
+
+    def delete_npc(self, user_id: str, campaign_id: str, npc_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode excluir NPCs.")
+            deleted = conn.execute(
+                "DELETE FROM campaign_npcs WHERE id = ? AND campaign_id = ?",
+                (npc_id, campaign_id),
+            )
+            if deleted.rowcount == 0:
+                raise CampaignError(404, "NPC não encontrado.")
+
 
