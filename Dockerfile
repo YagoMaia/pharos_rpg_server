@@ -14,9 +14,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Instala dependências Python
+# Instala dependências Python com cache de buildkit, timeout estendido e retries resilientes
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && \
+    pip install --default-timeout=120 --retries 10 --prefer-binary -r requirements.txt
 
 # Copia código da aplicação
 COPY app ./app
