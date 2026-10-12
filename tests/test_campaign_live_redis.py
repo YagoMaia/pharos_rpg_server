@@ -110,20 +110,12 @@ class CampaignLiveRedisTests(unittest.TestCase):
 
     def test_gm_player_reconnect_and_logout(self):
         gm = self.post(
-            "/auth/register",
-            {
-                "email": "gm@example.com",
-                "displayName": "GM",
-                "password": "safe-password-123",
-            },
+            "/auth/table-login",
+            {"name": "Victor", "pin": "victor"},
         )["accessToken"]
         player = self.post(
-            "/auth/register",
-            {
-                "email": "player@example.com",
-                "displayName": "Player",
-                "password": "safe-password-123",
-            },
+            "/auth/table-login",
+            {"name": "Gabriel", "pin": "gabriel"},
         )["accessToken"]
         campaign = self.post("/campaigns", {"name": "Mesa"}, gm)["id"]
         invite = self.post(f"/campaigns/{campaign}/invites", token=gm)["code"]
@@ -142,12 +134,8 @@ class CampaignLiveRedisTests(unittest.TestCase):
             self.assertEqual(denied.exception.code, 1008)
         with self.client.websocket_connect(f"/ws/{room}") as unlinked:
             outsider = self.post(
-                "/auth/register",
-                {
-                    "email": "outsider@example.com",
-                    "displayName": "Outsider",
-                    "password": "safe-password-123",
-                },
+                "/auth/table-login",
+                {"name": "Wayne", "pin": "wayne"},
             )["accessToken"]
             unlinked.send_json(
                 {"type": "AUTH_CAMPAIGN", "payload": {"token": outsider}}
