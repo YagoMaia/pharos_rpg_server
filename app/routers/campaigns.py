@@ -38,7 +38,7 @@ class RegisterBody(BaseModel):
         min_length=5, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
     )
     displayName: str = Field(min_length=1, max_length=80)
-    password: str = Field(min_length=12, max_length=128)
+    password: str = Field(min_length=8, max_length=128)
 
     @field_validator("email", "displayName", mode="before")
     @classmethod

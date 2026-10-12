@@ -212,6 +212,24 @@ class CampaignApiTests(unittest.TestCase):
             self.client.get("/campaigns/not-found", headers=gm).status_code, 404
         )
 
+    def test_registration_accepts_eight_characters_but_rejects_seven(self):
+        def register_with(password, email):
+            return self.client.post(
+                "/auth/register",
+                json={"email": email, "displayName": "Jogador", "password": password},
+            )
+
+        self.assertEqual(register_with("1234567", "short@example.com").status_code, 422)
+        registered = register_with("12345678", "valid@example.com")
+        self.assertEqual(registered.status_code, 201)
+        self.assertEqual(
+            self.client.post(
+                "/auth/login",
+                json={"email": "valid@example.com", "password": "12345678"},
+            ).status_code,
+            200,
+        )
+
     def test_character_id_cannot_be_claimed_by_another_member(self):
         gm = self.register("gm@example.com")
         first = self.register("first@example.com")
