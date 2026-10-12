@@ -1,13 +1,15 @@
-"""API de campanhas: autenticada, separada da sala de combate WebSocket."""
-
+import random
 from functools import lru_cache
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.core.config import settings
+from app.managers.connection import manager
+from app.models.domain import CombatSession, Combatant
 from app.services.campaign_store import CampaignStore
 
 router = APIRouter()
@@ -99,6 +101,27 @@ class JournalEntryBody(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     body: str = Field(min_length=1, max_length=10000)
     visibility: Literal["gm", "party"]
+
+
+class EncounterBody(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=20000)
+    tactics: str = Field(default="", max_length=20000)
+    rewards: str = Field(default="", max_length=1000)
+    status: Literal["planned", "ready", "completed"] = "planned"
+    monstersData: list[dict] = Field(default_factory=list)
+
+
+class NpcBody(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=120)
+    role: str = Field(default="", max_length=120)
+    attitude: Literal["friendly", "neutral", "hostile", "unknown"] = "neutral"
+    description: str = Field(default="", max_length=20000)
+    gmNotes: str = Field(default="", max_length=20000)
+    combatData: dict | None = None
+    visibility: Literal["party", "gm"] = "party"
 
 
 Store = Annotated[CampaignStore, Depends(get_campaign_store)]
@@ -296,4 +319,196 @@ def update_entry(
 def delete_entry(campaign_id: str, entry_id: str, user: User, store: Store):
     store.delete_entry(user["id"], campaign_id, entry_id)
     return Response(status_code=204)
+
+
+# --- ENCOUNTERS ---
+@router.get("/campaigns/{campaign_id}/encounters")
+def list_encounters(campaign_id: str, user: User, store: Store):
+    return store.list_encounters(user["id"], campaign_id)
+
+
+@router.post("/campaigns/{campaign_id}/encounters", status_code=201)
+def create_encounter(campaign_id: str, body: EncounterBody, user: User, store: Store):
+    return store.create_encounter(
+        user["id"],
+        campaign_id,
+        body.name,
+        body.description,
+        body.tactics,
+        body.rewards,
+        body.status,
+        body.monstersData,
+    )
+
+
+@router.put("/campaigns/{campaign_id}/encounters/{encounter_id}")
+def update_encounter(
+    campaign_id: str, encounter_id: str, body: EncounterBody, user: User, store: Store
+):
+    return store.update_encounter(
+        user["id"],
+        campaign_id,
+        encounter_id,
+        body.name,
+        body.description,
+        body.tactics,
+        body.rewards,
+        body.status,
+        body.monstersData,
+    )
+
+
+@router.delete("/campaigns/{campaign_id}/encounters/{encounter_id}", status_code=204)
+def delete_encounter(campaign_id: str, encounter_id: str, user: User, store: Store):
+    store.delete_encounter(user["id"], campaign_id, encounter_id)
+    return Response(status_code=204)
+
+
+@router.post("/campaigns/{campaign_id}/encounters/{encounter_id}/launch")
+async def launch_encounter(
+    campaign_id: str, encounter_id: str, user: User, store: Store
+):
+    encounter = store.get_encounter(user["id"], campaign_id, encounter_id)
+    session_id = f"campaign-{campaign_id}".lower()
+    state = await manager.get_state(session_id)
+    if not state:
+        state = CombatSession(
+            session_id=session_id,
+            turn_order=[],
+            combatants={},
+            logs=[f"Sessão de combate {session_id} iniciada pelo Mestre."],
+        )
+
+    added_count = 0
+    monsters_data = encounter.get("monstersData", [])
+    for m in monsters_data:
+        name = m.get("name", "Monstro")
+        count = max(1, int(m.get("count", 1)))
+        hp_val = int(m.get("hp", 10))
+        ac_val = int(m.get("ac", 10))
+        init_bonus = int(
+            m.get("initiativeBonus")
+            or m.get("attributes", {}).get("Destreza", {}).get("modifier", 0)
+        )
+
+        for i in range(count):
+            combatant_name = f"{name} #{i + 1}" if count > 1 else name
+            combatant_id = f"npc:{uuid4()}"
+            init_roll = random.randint(1, 20) + init_bonus
+
+            weapons_dict = {}
+            raw_weapons = m.get("weapons", {})
+            if isinstance(raw_weapons, dict):
+                weapons_dict = raw_weapons
+            elif isinstance(raw_weapons, list):
+                for w_idx, w in enumerate(raw_weapons):
+                    w_id = w.get("id", f"w_{w_idx}")
+                    weapons_dict[w_id] = {
+                        "name": w.get("name", "Ataque"),
+                        "damage": w.get("damage", "1d6"),
+                        "attribute": w.get("attribute", "Força"),
+                        "attackBonus": int(w.get("bonus", w.get("attackBonus", init_bonus))),
+                        "range": w.get("range", "1.5m"),
+                        "damageBonus": int(w.get("damageBonus", 0)),
+                    }
+            if not weapons_dict:
+                weapons_dict = {
+                    "default": {
+                        "name": "Ataque Básico",
+                        "damage": "1d6",
+                        "attribute": "Força",
+                        "attackBonus": init_bonus,
+                        "range": "1.5m",
+                        "damageBonus": 0,
+                    }
+                }
+
+            combatant = Combatant(
+                id=combatant_id,
+                name=combatant_name,
+                type="npc",
+                armorClass=ac_val,
+                baseArmorClass=ac_val,
+                initiative=init_roll,
+                hp={"current": hp_val, "max": hp_val},
+                focus={"current": 0, "max": 0},
+                turnActions={"standard": True, "bonus": True, "reaction": True},
+                weapons=weapons_dict,
+                attributes=m.get("attributes", {}),
+                skills=m.get("skills", []),
+                stances=m.get("stances", []),
+            )
+            state.combatants[combatant_id] = combatant
+            state.turn_order.append(combatant_id)
+            state.logs.append(
+                f"(Encontro) {combatant_name} entrou na iniciativa ({init_roll})."
+            )
+            added_count += 1
+
+    state.turn_order.sort(
+        key=lambda x: state.combatants[x].initiative, reverse=True
+    )
+
+    store.update_encounter(
+        user["id"],
+        campaign_id,
+        encounter_id,
+        encounter["name"],
+        encounter["description"],
+        encounter["tactics"],
+        encounter["rewards"],
+        "ready",
+        monsters_data,
+    )
+
+    await manager.broadcast_state(session_id, state)
+    return {
+        "status": "launched",
+        "encounterId": encounter_id,
+        "combatantsAdded": added_count,
+    }
+
+
+# --- NPCS ---
+@router.get("/campaigns/{campaign_id}/npcs")
+def list_npcs(campaign_id: str, user: User, store: Store):
+    return store.list_npcs(user["id"], campaign_id)
+
+
+@router.post("/campaigns/{campaign_id}/npcs", status_code=201)
+def create_npc(campaign_id: str, body: NpcBody, user: User, store: Store):
+    return store.create_npc(
+        user["id"],
+        campaign_id,
+        body.name,
+        body.role,
+        body.attitude,
+        body.description,
+        body.gmNotes,
+        body.combatData,
+        body.visibility,
+    )
+
+
+@router.put("/campaigns/{campaign_id}/npcs/{npc_id}")
+def update_npc(campaign_id: str, npc_id: str, body: NpcBody, user: User, store: Store):
+    return store.update_npc(
+        user["id"],
+        campaign_id,
+        npc_id,
+        body.name,
+        body.role,
+        body.attitude,
+        body.description,
+        body.gmNotes,
+        body.combatData,
+        body.visibility,
+    )
+
+
+@router.delete("/campaigns/{campaign_id}/npcs/{npc_id}", status_code=204)
+def delete_npc(campaign_id: str, npc_id: str, user: User, store: Store):
+    store.delete_npc(user["id"], campaign_id, npc_id)
+    return Response(status_code=204)
+
 
