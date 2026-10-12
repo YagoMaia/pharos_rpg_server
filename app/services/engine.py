@@ -1,10 +1,32 @@
-from app.models.domain import Combatant, CombatSession
-from app.models.events import RemoveCombatantPayload, ResolveActionPayload
+import asyncio
+from collections import defaultdict
+
+from app.managers.connection import ConnectionManager
+from app.models.domain import CombatSession
+from app.services.gm_service import GMService
+from app.services.player_service import PlayerService
+
+
+GM_EVENTS = {
+    "GM_CONNECT",
+    "GM_UPDATE_COMBATANT",
+    "GM_ADD_NPC",
+    "GM_REMOVE_COMBATANT",
+    "GM_ADVANCE_PHASE",
+    "END_COMBAT",
+    "APPLY_CONDITION",
+    "REMOVE_CONDITION",
+}
+
+
+class AuthorizationError(ValueError):
+    pass
 
 
 class GameLogic:
-    def __init__(self, manager):
-        self.manager = manager  # Instância do ConnectionManager criada anteriormente
+    def __init__(self, manager: ConnectionManager):
+        self.manager = manager
+        self._locks = defaultdict(asyncio.Lock)
 
     def _create_session(self, session_id: str) -> CombatSession:
         """Cria uma nova instância de sessão vazia"""
@@ -15,401 +37,202 @@ class GameLogic:
             logs=[f"Sessão {session_id} iniciada."],
         )
 
-    async def handle_message(self, session_id: str, data: dict):
-        # 1. Recupera estado atual do Redis
-        state = await self.manager.get_state(session_id)
+    def _owned_by_client(self, state: CombatSession, combatant_id: str, client_id: str) -> bool:
+        return state.combatantOwners.get(combatant_id) == client_id
 
-        event_type = data.get("type")
-        payload = data.get("payload")
+    @staticmethod
+    def _authorize_sheet(state: CombatSession, actor_id: str, identity: dict):
+        actor = state.combatants.get(actor_id)
+        if actor and actor.type == "pet":
+            actor = state.combatants.get(actor.ownerId)
+        if not actor or actor.sheetId != identity["character_id"]:
+            raise AuthorizationError("A ficha vinculada não controla este personagem.")
 
-        # Se não existe estado e o evento não é JOIN ou CREATE, erro
-        if not state:
-            if not state:
-                # Se for Jogador entrando OU Mestre conectando, criamos a sessão
-                if event_type in ["JOIN_SESSION", "GM_CONNECT"]:
-                    state = self._create_session(session_id)
-                    print(f"Sessão {session_id} criada por {event_type}")
-                else:
-                    return
+    def _authorize_gm(self, state: CombatSession, client_id: str, identity: dict):
+        if state.gmClientId is None:
+            state.gmClientId = client_id
+        if state.gmClientId != client_id:
+            raise AuthorizationError("Apenas o GM da sessão pode executar este comando.")
+        identity["role"] = "gm"
 
-        if not payload:
+    def _authorize_join(self, state: CombatSession, payload: dict, client_id: str, identity: dict):
+        combatant = payload.get("combatant") if isinstance(payload, dict) else None
+        if not isinstance(combatant, dict) or not combatant.get("id"):
+            raise AuthorizationError("JOIN_SESSION requer combatant.id válido.")
+
+        combatant_id = combatant["id"]
+        owner = state.combatantOwners.get(combatant_id)
+        if owner is not None and owner != client_id:
+            raise AuthorizationError("Este personagem já pertence a outro usuário conectado.")
+
+        state.combatantOwners[combatant_id] = client_id
+        identity["role"] = "player"
+        identity["player_id"] = combatant_id
+
+        pet = payload.get("pet")
+        if isinstance(pet, dict) and pet.get("id"):
+            if pet.get("ownerId") != combatant_id:
+                raise AuthorizationError("Pet deve pertencer ao personagem enviado no JOIN_SESSION.")
+            pet_owner = state.combatantOwners.get(pet["id"])
+            if pet_owner is not None and pet_owner != client_id:
+                raise AuthorizationError("Este pet já pertence a outro usuário conectado.")
+            state.combatantOwners[pet["id"]] = client_id
+
+    def _authorize_player_command(self, state: CombatSession, event_type: str, payload: dict, identity: dict):
+        if identity.get("role") == "gm":
             return
 
-        # --- Roteamento de Eventos ---
+        client_id = identity.get("client_id")
+        if not client_id:
+            raise AuthorizationError("Comando requer clientId.")
+
+        if event_type == "END_TURN":
+            if not state.turn_order:
+                return
+            active_id = state.turn_order[state.turn_index]
+            if not self._owned_by_client(state, active_id, client_id):
+                raise AuthorizationError("Apenas o dono do turno atual ou o GM pode encerrar o turno.")
+            if identity.get("authenticated"):
+                self._authorize_sheet(state, active_id, identity)
+            return
+
+        actor_id = payload.get("attackerId") or payload.get("combatantId")
+        if not actor_id or not self._owned_by_client(state, actor_id, client_id):
+            raise AuthorizationError("Você só pode comandar seu personagem ou pet.")
+        if identity.get("authenticated"):
+            self._authorize_sheet(state, actor_id, identity)
+
+    def _authorize(self, state: CombatSession, event_type: str, payload: dict, identity: dict | None):
+        if identity is None:
+            return
+
+        if identity.get("authenticated"):
+            client_id = identity["client_id"]
+            if event_type in GM_EVENTS:
+                if identity["role"] != "gm":
+                    raise AuthorizationError("Apenas o mestre da campanha pode executar este comando.")
+                self._authorize_gm(state, client_id, identity)
+                return
+            if event_type == "JOIN_SESSION":
+                combatant = payload.get("combatant") if isinstance(payload, dict) else None
+                if identity["role"] != "player" or not isinstance(combatant, dict):
+                    raise AuthorizationError("Apenas jogadores vinculados podem entrar no combate.")
+                if combatant.get("type") != "player" or combatant.get("sheetId") != identity["character_id"]:
+                    raise AuthorizationError("A ficha enviada não corresponde à ficha vinculada.")
+                existing = state.combatants.get(combatant.get("id"))
+                if existing and existing.type != "player":
+                    raise AuthorizationError("Este ID de personagem já está em uso.")
+                if existing and existing.sheetId != identity["character_id"]:
+                    raise AuthorizationError("A ficha vinculada não corresponde ao personagem existente.")
+                self._authorize_join(state, payload, client_id, identity)
+                return
+            self._authorize_player_command(state, event_type, payload or {}, identity)
+            return
+
+        client_id = None
+        if isinstance(payload, dict):
+            client_id = payload.get("clientId")
+        client_id = client_id or identity.get("client_id")
+        if client_id:
+            identity["client_id"] = client_id
 
         if event_type == "GM_CONNECT":
-            await self._handle_gm_connect(state)
-
-        elif event_type == "GM_UPDATE_COMBATANT":
-            await self._handle_gm_update_combatant(state, payload)
-
-        elif event_type == "GM_ADD_NPC":
-            await self._handle_add_npc(state, payload)
-
-        elif event_type == "GM_REMOVE_COMBATANT":
-            await self._handle_remove_combatant(state, payload)
-
-        elif event_type == "JOIN_SESSION":
-            await self._handle_join_session(state, payload)
-
-        elif event_type == "MANUAL_UPDATE":
-            await self._handle_update_hp(state, payload)
-
-        elif event_type == "CHANGE_STANCE":
-            await self._handle_change_stance(state, payload)
-
-        elif event_type == "END_TURN":
-            await self._handle_next_turn(state)
-
-        elif event_type == "RESOLVE_ACTION":
-            await self._handle_resolve_action(state, payload)
-
-        # Salva e notifica a todos
-        if state and state.session_id:
-            await self.manager.broadcast_state(session_id, state)
-
-    # --- Implementação das Regras ---
-
-    async def _handle_gm_connect(self, state: CombatSession):
-        # Não adiciona na lista de combatentes, apenas loga
-        state.logs.append("O Mestre (GM) conectou na sala.")
-
-    async def _handle_join_session(self, state: CombatSession, payload: dict):
-        combatant_data = payload.get("combatant")
-        new_combatant = Combatant(**combatant_data)
-
-        # 1. VERIFICAÇÃO SEGURA: Checa se o ID já está nas chaves do dicionário
-        if new_combatant.id in state.combatants:
-            # Recupera a versão que está salva no Redis (O estado da batalha)
-            existing = state.combatants[new_combatant.id]
-
-            # --- LÓGICA DE MERGE (ATUALIZAÇÃO SEGURA) ---
-
-            # Atualiza STATUS (Permite que ele volte curado/descansado)
-            existing.hp = new_combatant.hp
-            existing.currentFocus = new_combatant.currentFocus
-            existing.maxFocus = new_combatant.maxFocus
-
-            # Atualiza FICHA (Caso tenha trocado de arma ou upado de nível)
-            existing.attributes = new_combatant.attributes
-            existing.equipment = new_combatant.equipment
-            existing.skills = new_combatant.skills
-            existing.armorClass = new_combatant.armorClass
-            existing.spells = new_combatant.spells
-
-            # --- O QUE NÃO ATUALIZAMOS (PROTEÇÃO) ---
-            # existing.initiative      -> Mantém o lugar na fila
-            # existing.turnActions     -> Impede "roubar" ações saindo e voltando
-            # existing.activeStanceId  -> Mantém a postura ativa
-
-            state.logs.append(f"{new_combatant.name} retornou (Status Sincronizados).")
+            if not client_id:
+                raise AuthorizationError("GM_CONNECT requer clientId.")
+            self._authorize_gm(state, client_id, identity)
             return
 
-        # --- CENÁRIO: NOVO JOGADOR ---
-        # Adiciona ao dicionário
-        state.combatants[new_combatant.id] = new_combatant
-
-        # Adiciona à ordem de turnos
-        if new_combatant.id not in state.turn_order:
-            state.turn_order.append(new_combatant.id)
-            # Reordena por iniciativa
-            state.turn_order.sort(
-                key=lambda x: state.combatants[x].initiative, reverse=True
-            )
-
-        state.logs.append(f"{new_combatant.name} entrou no combate.")
-
-    async def _handle_add_npc(self, state: CombatSession, payload: dict):
-        """
-        Adiciona um NPC ao combate.
-        Diferente do Player, o NPC entra direto via comando do Mestre.
-        """
-        # O payload já deve vir com o objeto Combatant pronto (montado no Front)
-        combatant_data = payload
-        new_npc = Combatant(**combatant_data)
-
-        # Adiciona ao mapa de combatentes
-        state.combatants[new_npc.id] = new_npc
-
-        # Adiciona à ordem de iniciativa
-        state.turn_order.append(new_npc.id)
-
-        # Reordena (Iniciativa maior -> menor)
-        state.turn_order.sort(
-            key=lambda x: state.combatants[x].initiative, reverse=True
-        )
-
-        state.logs.append(f"(GM) Adicionou inimigo: {new_npc.name}")
-
-    async def _handle_remove_combatant(self, state: CombatSession, payload: dict):
-        """
-        Remove um combatente (morto ou deletado) e ajusta o índice de turno
-        para a fila não pular ninguém incorretamente.
-        """
-        # Converte payload
-        data = RemoveCombatantPayload(**payload)
-        c_id = data.combatantId
-
-        if c_id not in state.combatants:
+        if event_type in GM_EVENTS:
+            if not client_id:
+                raise AuthorizationError("Comando de GM requer clientId.")
+            self._authorize_gm(state, client_id, identity)
             return
 
-        # 1. Recupera nome para o log antes de deletar
-        name = state.combatants[c_id].name
-
-        # 2. Descobre o índice dele na ordem atual
-        try:
-            removed_index = state.turn_order.index(c_id)
-        except ValueError:
-            removed_index = -1
-
-        # 3. Remove dos dados
-        del state.combatants[c_id]
-        if c_id in state.turn_order:
-            state.turn_order.remove(c_id)
-
-        # 4. Ajuste Matemático do Turno (A parte crítica!)
-        # Se removemos alguém que estava ANTES do jogador atual na fila,
-        # o índice do jogador atual diminui em 1 (a fila andou para trás).
-        if removed_index != -1 and removed_index < state.turn_index:
-            state.turn_index = max(0, state.turn_index - 1)
-
-        # Se removemos O jogador atual, o índice agora aponta para o próximo automaticamente,
-        # mas precisamos garantir que não estourou o tamanho da lista.
-        if len(state.turn_order) > 0:
-            state.turn_index = state.turn_index % len(state.turn_order)
-        else:
-            state.turn_index = 0
-
-        state.logs.append(f"{name} foi removido do combate.")
-
-    async def _handle_resolve_action(self, state: CombatSession, payload: dict):
-        data = ResolveActionPayload(**payload)
-
-        attacker = state.combatants.get(data.attackerId)
-        if not attacker:
+        if event_type == "JOIN_SESSION":
+            if not client_id:
+                raise AuthorizationError("JOIN_SESSION requer clientId.")
+            self._authorize_join(state, payload, client_id, identity)
             return
 
-        # --- 0. VALIDAÇÃO DE TURNO (A MUDANÇA ESTÁ AQUI) ---
+        self._authorize_player_command(state, event_type, payload or {}, identity)
 
-        # Quem é o dono do turno atual?
-        current_turn_id = state.turn_order[state.turn_index]
+    async def handle_message(self, session_id: str, data: dict, identity: dict | None = None):
+        session_id = session_id.lower()
+        event_type = data.get("type")
 
-        # Se NÃO é o turno do atacante E NÃO é uma reação, bloqueia.
-        if attacker.id != current_turn_id and data.costType != "reaction":
-            # (Opcional) Enviar erro para o usuário via socket individual
-            print(f"Bloqueado: {attacker.name} tentou agir fora do turno.")
+        # Heartbeat - responde imediatamente sem lock nem estado
+        if event_type == "PING":
             return
 
-        # --- 1. VERIFICAÇÃO DE ECONOMIA DE AÇÕES (Action Economy) ---
-        # Se for um ataque básico ou skill, consome a ação padrão/bônus
-        if data.costType == "standard":
-            if not attacker.turnActions.standard:
-                # Opcional: Logar tentativa falha
-                return
-            attacker.turnActions.standard = False  # GASTOU A AÇÃO
+        async with self._locks[session_id]:
+            # 1. Recupera estado atual
+            state = await self.manager.get_state(session_id)
+            payload = data.get("payload")
 
-        elif data.costType == "bonus":
-            if not attacker.turnActions.bonus:
-                return
-            attacker.turnActions.bonus = False
-
-        elif data.costType == "reaction":
-            if not attacker.turnActions.reaction:
-                return
-            attacker.turnActions.reaction = False
-
-        # --- 2. VERIFICAÇÃO DE RECURSOS (FOCO) ---
-        # Se for Ataque Básico, focusCost será 0, então passa direto
-        if data.focusCost > 0:
-            if attacker.currentFocus < data.focusCost:
-                state.logs.append(
-                    f"{attacker.name} tentou usar {data.actionName} sem Foco suficiente."
-                )
-                # Devolve a ação que foi gasta no passo 1 (Rollback simples)
-                if data.costType == "standard":
-                    attacker.turnActions.standard = True
-                return
-
-            attacker.currentFocus -= data.focusCost
-
-        # --- 3. APLICAÇÃO DE EFEITOS (DANO/CURA) ---
-        target = state.combatants.get(data.targetId) if data.targetId else None
-        log_detail = ""
-
-        if target:
-            # Lógica de Dano
-            if data.damageAmount > 0:
-                old_hp = target.hp.current
-                target.hp.current = max(0, target.hp.current - data.damageAmount)
-                damage_done = old_hp - target.hp.current
-                log_detail = f"causando {damage_done} de dano em {target.name}"
-
-                if target.hp.current == 0:
-                    log_detail += " (CAIU!)"
-
-            # Lógica de Cura
-            elif data.healingAmount > 0:
-                old_hp = target.hp.current
-                target.hp.current = min(
-                    target.hp.max, target.hp.current + data.healingAmount
-                )
-                healed = target.hp.current - old_hp
-                log_detail = f"curando {healed} PV de {target.name}"
-
-            else:
-                log_detail = f"em {target.name} (sem dano)"
-        else:
-            log_detail = "(efeito sem alvo)"
-
-        # --- 4. LOG FINAL ---
-        state.logs.append(f"{attacker.name} usou {data.actionName} {log_detail}.")
-
-    async def _handle_gm_update_combatant(self, state: CombatSession, payload: dict):
-        target_id = payload["combatantId"]
-        value = payload["value"]
-        field = payload["field"]
-
-        combatant = state.combatants.get(target_id)
-
-        if combatant:
-            if field == "hp_current":
-                diff = combatant.hp.current - value
-                combatant.hp.current = value
-
-                # Log simples
-                action_text = "curou" if diff < 0 else "deu dano"
-                state.logs.append(
-                    f"Mestre {action_text} {combatant.name} - {abs(diff)} PV."
-                )
-
-                if combatant.hp.current == 0:
-                    state.logs.append(f"{combatant.name} caiu!")
-            elif field == "current_focus":
-                diff = combatant.currentFocus - value
-                combatant.currentFocus = value
-
-                # Log simples
-                action_text = "recuperou" if diff < 0 else "gastou"
-                state.logs.append(
-                    f"Mestre {action_text} {combatant.name} - {abs(diff)} Foco."
-                )
-
-                if combatant.currentFocus == 0:
-                    state.logs.append(f"{combatant.name} sem foco!")
-
-    async def _handle_update_hp(self, state: CombatSession, payload: dict):
-        target_id = payload["combatantId"]
-        new_hp = payload["newHp"]
-
-        combatant = state.combatants.get(target_id)
-        if combatant:
-            diff = combatant.hp.current - new_hp
-            combatant.hp.current = new_hp
-
-            # Log simples
-            action_text = "curado em" if diff < 0 else "recebeu dano de"
-            state.logs.append(f"{combatant.name} {action_text} {abs(diff)} PV.")
-
-            if combatant.hp.current == 0:
-                state.logs.append(f"{combatant.name} caiu!")
-
-    async def _handle_change_stance(self, state: CombatSession, payload: dict):
-        c_id = payload["combatantId"]
-        s_id = payload["stanceId"]
-        new_ac = payload["newAC"]  # Front já calculou (Base + Bonus da Stance)
-
-        combatant = state.combatants.get(c_id)
-        if combatant:
-            # Busca o nome da postura para o log
-
-            if s_id is None:
-                state.logs.append(
-                    f"{combatant.name} assumiu a postura Neutra (CA {new_ac})."
-                )
-                combatant.activeStanceId = None
-                combatant.armorClass = new_ac
-                return
-
-            stance_name = next(
-                (s.name for s in combatant.stances if s.id == s_id), "Desconhecida"
-            )
-
-            combatant.activeStanceId = s_id
-            combatant.armorClass = new_ac
-            combatant.turnActions.bonus = False
-            state.logs.append(
-                f"{combatant.name} assumiu a postura {stance_name} (CA {new_ac})."
-            )
-
-    async def _handle_next_turn(self, state: CombatSession):
-        # 1. Finaliza turno do atual
-        current_id = state.turn_order[state.turn_index]
-        current_actor = state.combatants.get(current_id)
-
-        if not current_actor:
-            return
-
-        # Opcional: Resetar reações do personagem que acabou de agir?
-        current_actor.turnActions.bonus = True
-        current_actor.turnActions.standard = True
-        current_actor.turnActions.reaction = True
-        # Depende da regra do seu sistema (Geralmente reseta no INÍCIO do turno dele)
-
-        # 2. Calcula próximo índice
-        state.turn_index = (state.turn_index + 1) % len(state.turn_order)
-
-        # 3. Prepara o próximo
-        next_id = state.turn_order[state.turn_index]
-        next_actor = state.combatants.get(next_id)
-
-        if next_actor:
-            if next_actor.hp.current <= 0 and next_actor.type == "npc":
-                state.logs.append(f"{next_actor.name} Morto")
-                await self._handle_remove_combatant(
-                    state, {"combatantId": next_actor.id}
-                )
-                return
-            # REGRA DE OURO: Resetar economia de ações no INÍCIO do turno
-            next_actor.turnActions.standard = True
-            next_actor.turnActions.bonus = True
-            next_actor.turnActions.reaction = True
-            # (Reação às vezes reseta no início da RODADA, ajuste conforme seu sistema)
-
-            state.logs.append(f"--- Turno de {next_actor.name} ---")
-
-    async def _handle_use_skill(self, state: CombatSession, payload: dict):
-        # Payload esperado: { combatantId, skillId }
-        c_id = payload["combatantId"]
-        s_id = payload["skillId"]
-        combatant = state.combatants.get(c_id)
-
-        if not combatant:
-            return
-
-        skill = next((s for s in combatant.skills if s.id == s_id), None)
-
-        if combatant and skill:
-            # Verifica custos
-            cost_type = skill.actionType  # "Padrão", "Ação Bônus", etc.
-
-            can_act = False
-            if cost_type == "Padrão" and combatant.turnActions.standard:
-                combatant.turnActions.standard = False
-                can_act = True
-            elif cost_type == "Ação Bônus" and combatant.turnActions.bonus:
-                combatant.turnActions.bonus = False
-                can_act = True
-            elif cost_type == "Reação" and combatant.turnActions.reaction:
-                combatant.turnActions.reaction = False
-                can_act = True
-
-            if can_act:
-                # Gasta Foco
-                if combatant.currentFocus >= skill.cost:
-                    combatant.currentFocus -= skill.cost
-                    state.logs.append(
-                        f"{combatant.name} usou {skill.name} (Custo: {skill.cost} Foco)."
-                    )
+            # 2. Inicialização da Sessão (Corrigido e sem duplicidade)
+            if not state:
+                if event_type in ["JOIN_SESSION", "GM_CONNECT"]:
+                    state = self._create_session(session_id)
                 else:
-                    # Se falhar validação, poderíamos enviar uma msg de erro específica apenas para o usuário
-                    pass
+                    return  # Não processa comandos se a sala não existe
+
+            # 3. Validação de Payload
+            if not payload and event_type not in [
+                "END_TURN",
+                "END_COMBAT",
+                "GM_CONNECT",
+            ]:
+                return
+
+            # 4. Processamento da Lógica
+            previous_combatants = set(state.combatants)
+            self._authorize(state, event_type, payload, identity)
+            match event_type:
+                case "GM_CONNECT":
+                    await GMService.gm_connect(state)
+                case "GM_UPDATE_COMBATANT":
+                    await GMService.update_combatant(state, payload)
+                case "GM_ADD_NPC":
+                    await GMService.add_npc(state, payload)
+                case "GM_REMOVE_COMBATANT":
+                    await GMService.remove_combatant(state, payload)
+                case "GM_ADVANCE_PHASE":
+                    await GMService.advance_phase(state, payload)
+                case "END_COMBAT":
+                    await GMService.end_combat(state)
+                case "JOIN_SESSION":
+                    await PlayerService.join_session(state, payload)
+                case "MANUAL_UPDATE":
+                    await PlayerService.update_hp(state, payload)
+                case "CHANGE_STANCE":
+                    await PlayerService.change_stance(state, payload)
+                case "END_TURN":
+                    await PlayerService.next_turn(state)
+                case "RESOLVE_ACTION":
+                    await PlayerService.resolve_action(state, payload)
+                case "ROLL_DEATH_SAVE":
+                    await PlayerService.roll_death_save(state, payload)
+                case "APPLY_CONDITION":
+                    await PlayerService.apply_condition(state, payload)
+                case "REMOVE_CONDITION":
+                    await PlayerService.remove_condition(state, payload)
+
+            # 5. Persistência e Broadcast (Ainda dentro do Lock)
+            if state:
+                # Broadcast TOTAL apenas para mudanças de lista/estrutura
+                structural_events = [
+                    "JOIN_SESSION",
+                    "GM_CONNECT",
+                    "END_COMBAT",
+                    "GM_ADD_NPC",
+                    "GM_REMOVE_COMBATANT",
+                    "GM_ADVANCE_PHASE",
+                ]
+                if event_type in structural_events or previous_combatants != set(state.combatants):
+                    # broadcast_state já faz set + publish
+                    await self.manager.broadcast_state(session_id, state)
+                else:
+                    # Apenas persiste (o evento delta já foi enviado pelo service)
+                    await self.manager.redis.set(
+                        f"state:{session_id}", state.model_dump_json(), ex=3600
+                    )

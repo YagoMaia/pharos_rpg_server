@@ -1,48 +1,68 @@
-from typing import Literal, Optional, Union
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel
 
-
-class JoinSessionPayload(BaseModel):
-    sessionId: str
-    character: dict  # Recebe o objeto Character completo do TS
-
-
-class UpdateHPPayload(BaseModel):
-    combatantId: str
-    newHp: int
-
-
-class ChangeStancePayload(BaseModel):
-    combatantId: str
-    stanceId: str
-    newAC: int  # O front calcula o novo AC e o back confia (ou revalida)
-
-
-class WebSocketMessage(BaseModel):
-    type: Literal[
-        "JOIN_SESSION", "UPDATE_HP", "CHANGE_STANCE", "NEXT_TURN", "USE_ACTION"
-    ]
-    payload: Union[JoinSessionPayload, UpdateHPPayload, ChangeStancePayload, dict]
-
-
 ActionCostType = Literal["standard", "bonus", "reaction", "free", "none"]
+
+ConditionName = Literal[
+    "Cego", "Surdo", "Prostrado", "Confuso", "Amedrontado",
+    "Intimidado", "Incapacitado", "Paralisado", "Envenenado",
+    "Agarrado", "Lento", "Atordoado"
+]
 
 
 class RemoveCombatantPayload(BaseModel):
     combatantId: str
 
 
+class ActionTarget(BaseModel):
+    """Dano/cura individual por alvo em ataques multi-target."""
+    targetId: str
+    damageAmount: int = 0
+    healingAmount: int = 0
+
+
+# --- SISTEMA DE CONDIÇÕES ---
+
+class ConditionPayload(BaseModel):
+    """Condição a ser aplicada em um alvo durante uma ação."""
+    targetId: str
+    conditionName: ConditionName
+    durationTurns: Optional[int] = None  # None = permanente
+    description: str
+
+
+class ApplyConditionPayload(BaseModel):
+    """GM aplica manualmente uma condição."""
+    combatantId: str
+    conditionName: ConditionName
+    durationTurns: Optional[int] = None
+    description: str
+
+
+class RemoveConditionPayload(BaseModel):
+    """GM ou sistema remove uma condição pelo ID."""
+    combatantId: str
+    conditionId: str
+
+
 class ResolveActionPayload(BaseModel):
     attackerId: str
-    targetId: Optional[str] = None  # Pode ser null (ex: buff em si mesmo)
+    targetId: Optional[str] = None  
 
-    actionName: str  # Ex: "Espada Longa", "Bola de Fogo", "Cura"
+    # Multi-target: lista opcional de alvos individuais
+    targets: Optional[List[ActionTarget]] = None
+
+    actionName: str 
 
     # CUSTOS
     costType: ActionCostType = "standard"
     focusCost: int = 0  # 0 para ataques básicos, >0 para skills
 
-    # EFEITOS (Calculados no frontend)
+    # EFEITOS single-target (Calculados no frontend)
     damageAmount: int = 0
     healingAmount: int = 0
+
+    # CONDIÇÕES a aplicar nos alvos
+    appliedConditions: Optional[List[ConditionPayload]] = None
+

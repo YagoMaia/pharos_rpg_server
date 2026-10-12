@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local campaign database
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
