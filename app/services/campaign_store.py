@@ -135,6 +135,17 @@ class CampaignStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_npcs_campaign
                     ON campaign_npcs(campaign_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS npc_templates (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL REFERENCES users(id),
+                    name TEXT NOT NULL,
+                    level INTEGER NOT NULL DEFAULT 1,
+                    template_data TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_npc_templates_user
+                    ON npc_templates(user_id, updated_at DESC);
             """)
             # Migration segura para character_data em bases SQLite já criadas
             cols = [row["name"] for row in conn.execute("PRAGMA table_info(members)").fetchall()]
@@ -1003,5 +1014,127 @@ class CampaignStore:
             )
             if deleted.rowcount == 0:
                 raise CampaignError(404, "NPC não encontrado.")
+
+    @staticmethod
+    def _npc_template(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "userId": row["user_id"],
+            "name": row["name"],
+            "level": row["level"],
+            "templateData": json.loads(row["template_data"]) if row["template_data"] else {},
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def list_npc_templates(self, user_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM npc_templates WHERE user_id = ? ORDER BY updated_at DESC",
+                (user_id,),
+            ).fetchall()
+            return [self._npc_template(row) for row in rows]
+
+    def create_npc_template(
+        self,
+        user_id: str,
+        name: str,
+        level: int = 1,
+        template_data: dict | None = None,
+        template_id: str | None = None,
+        updated_at: str | None = None,
+    ) -> dict:
+        tid = template_id or str(uuid4())
+        now = updated_at or datetime.now(timezone.utc).isoformat()
+        clean_name = name.strip()
+        if not clean_name:
+            raise CampaignError(400, "Nome do template é obrigatório.")
+        tdata_json = json.dumps(template_data or {})
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                """INSERT INTO npc_templates (id, user_id, name, level, template_data, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (tid, user_id, clean_name, int(level), tdata_json, now, now),
+            )
+            row = conn.execute("SELECT * FROM npc_templates WHERE id = ?", (tid,)).fetchone()
+            return self._npc_template(row)
+
+    def update_npc_template(
+        self,
+        user_id: str,
+        template_id: str,
+        name: str,
+        level: int = 1,
+        template_data: dict | None = None,
+        updated_at: str | None = None,
+    ) -> dict:
+        now = updated_at or datetime.now(timezone.utc).isoformat()
+        clean_name = name.strip()
+        if not clean_name:
+            raise CampaignError(400, "Nome do template é obrigatório.")
+        tdata_json = json.dumps(template_data or {})
+        with closing(self._connect()) as conn, conn:
+            updated = conn.execute(
+                """UPDATE npc_templates
+                SET name = ?, level = ?, template_data = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?""",
+                (clean_name, int(level), tdata_json, now, template_id, user_id),
+            )
+            if updated.rowcount == 0:
+                raise CampaignError(404, "Template não encontrado.")
+            row = conn.execute("SELECT * FROM npc_templates WHERE id = ?", (template_id,)).fetchone()
+            return self._npc_template(row)
+
+    def delete_npc_template(self, user_id: str, template_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            deleted = conn.execute(
+                "DELETE FROM npc_templates WHERE id = ? AND user_id = ?",
+                (template_id, user_id),
+            )
+            if deleted.rowcount == 0:
+                raise CampaignError(404, "Template não encontrado.")
+
+    def sync_npc_templates(self, user_id: str, local_templates: list[dict]) -> list[dict]:
+        with closing(self._connect()) as conn, conn:
+            existing = {
+                row["id"]: row
+                for row in conn.execute(
+                    "SELECT * FROM npc_templates WHERE user_id = ?", (user_id,)
+                ).fetchall()
+            }
+
+            now = datetime.now(timezone.utc).isoformat()
+
+            for item in local_templates:
+                tid = item.get("id") or str(uuid4())
+                name = (item.get("name") or "").strip()
+                if not name:
+                    continue
+                level = int(item.get("level") or 1)
+                tdata = item.get("templateData") or item.get("template_data") or item
+                tdata_json = json.dumps(tdata)
+                local_updated = item.get("updatedAt") or item.get("updated_at") or now
+
+                if tid in existing:
+                    server_updated = existing[tid]["updated_at"]
+                    if local_updated > server_updated:
+                        conn.execute(
+                            """UPDATE npc_templates
+                            SET name = ?, level = ?, template_data = ?, updated_at = ?
+                            WHERE id = ? AND user_id = ?""",
+                            (name, level, tdata_json, local_updated, tid, user_id),
+                        )
+                else:
+                    conn.execute(
+                        """INSERT INTO npc_templates (id, user_id, name, level, template_data, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (tid, user_id, name, level, tdata_json, local_updated, local_updated),
+                    )
+
+            rows = conn.execute(
+                "SELECT * FROM npc_templates WHERE user_id = ? ORDER BY updated_at DESC",
+                (user_id,),
+            ).fetchall()
+            return [self._npc_template(row) for row in rows]
 
 

@@ -124,6 +124,19 @@ class NpcBody(BaseModel):
     visibility: Literal["party", "gm"] = "party"
 
 
+class NpcTemplateBody(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=120)
+    level: int = Field(default=1, ge=1, le=30)
+    templateData: dict = Field(default_factory=dict)
+    updatedAt: str | None = None
+
+
+class NpcTemplateSyncBody(BaseModel):
+    templates: list[NpcTemplateBody] = Field(default_factory=list)
+
+
 Store = Annotated[CampaignStore, Depends(get_campaign_store)]
 User = Annotated[dict, Depends(current_user)]
 
@@ -510,5 +523,49 @@ def update_npc(campaign_id: str, npc_id: str, body: NpcBody, user: User, store: 
 def delete_npc(campaign_id: str, npc_id: str, user: User, store: Store):
     store.delete_npc(user["id"], campaign_id, npc_id)
     return Response(status_code=204)
+
+
+# --- NPC TEMPLATE LIBRARY (BESTIÁRIO DO MESTRE) ---
+@router.get("/npc-library")
+def list_npc_templates(user: User, store: Store):
+    return store.list_npc_templates(user["id"])
+
+
+@router.post("/npc-library", status_code=201)
+def create_npc_template(body: NpcTemplateBody, user: User, store: Store):
+    return store.create_npc_template(
+        user["id"],
+        name=body.name,
+        level=body.level,
+        template_data=body.templateData,
+        template_id=body.id,
+        updated_at=body.updatedAt,
+    )
+
+
+@router.put("/npc-library/{template_id}")
+def update_npc_template(
+    template_id: str, body: NpcTemplateBody, user: User, store: Store
+):
+    return store.update_npc_template(
+        user["id"],
+        template_id=template_id,
+        name=body.name,
+        level=body.level,
+        template_data=body.templateData,
+        updated_at=body.updatedAt,
+    )
+
+
+@router.delete("/npc-library/{template_id}", status_code=204)
+def delete_npc_template(template_id: str, user: User, store: Store):
+    store.delete_npc_template(user["id"], template_id)
+    return Response(status_code=204)
+
+
+@router.post("/npc-library/sync")
+def sync_npc_templates(body: NpcTemplateSyncBody, user: User, store: Store):
+    local_dicts = [t.model_dump() for t in body.templates]
+    return store.sync_npc_templates(user["id"], local_dicts)
 
 
