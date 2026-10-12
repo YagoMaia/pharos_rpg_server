@@ -476,3 +476,65 @@ class CampaignApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.post("/auth/logout", headers=first).status_code, 401
         )
+
+    def test_journal_delete_restricts_role_and_removes_entry(self):
+        gm = self.register("gm@example.com")
+        player = self.register("player@example.com")
+        campaign_id = self.campaign(gm)["id"]
+        code = self.invite(gm, campaign_id)["code"]
+        self.client.post("/campaigns/join", headers=player, json={"inviteCode": code})
+        url = f"/campaigns/{campaign_id}/entries"
+        entry = self.client.post(
+            url,
+            headers=gm,
+            json={
+                "title": "Aviso",
+                "body": "Texto a ser removido",
+                "visibility": "party",
+            },
+        ).json()
+        entry_url = f"{url}/{entry['id']}"
+
+        self.assertEqual(
+            self.client.delete(entry_url, headers=player).status_code, 403
+        )
+        self.assertEqual(
+            self.client.delete(f"{url}/missing", headers=gm).status_code, 404
+        )
+
+        deleted = self.client.delete(entry_url, headers=gm)
+        self.assertEqual(deleted.status_code, 204)
+        self.assertEqual(self.client.get(url, headers=gm).json(), [])
+        self.assertEqual(self.client.get(url, headers=player).json(), [])
+
+        self.assertEqual(
+            self.client.delete(entry_url, headers=gm).status_code, 404
+        )
+
+    def test_unlink_and_change_character_for_player(self):
+        gm = self.register("gm@example.com")
+        player = self.register("player@example.com")
+        campaign_id = self.campaign(gm)["id"]
+        code = self.invite(gm, campaign_id)["code"]
+        self.client.post("/campaigns/join", headers=player, json={"inviteCode": code})
+
+        char_url = f"/campaigns/{campaign_id}/character"
+        link1 = self.client.put(char_url, headers=player, json={"characterId": "hero-1"})
+        self.assertEqual(link1.status_code, 200)
+        self.assertEqual(link1.json()["characterId"], "hero-1")
+
+        link2 = self.client.put(char_url, headers=player, json={"characterId": "hero-2"})
+        self.assertEqual(link2.status_code, 200)
+        self.assertEqual(link2.json()["characterId"], "hero-2")
+
+        self.assertEqual(
+            self.client.delete(char_url, headers=gm).status_code, 403
+        )
+
+        unlinked = self.client.delete(char_url, headers=player)
+        self.assertEqual(unlinked.status_code, 200)
+        self.assertIsNone(unlinked.json()["characterId"])
+
+        campaign = self.client.get(f"/campaigns/{campaign_id}", headers=player).json()
+        self.assertIsNone(campaign["characterId"])
+

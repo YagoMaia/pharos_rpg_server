@@ -329,6 +329,17 @@ class CampaignStore:
                 ) from exc
             return self._summary(self._member(conn, campaign_id, user_id))
 
+    def unlink_character(self, user_id: str, campaign_id: str) -> dict:
+        with closing(self._connect()) as conn, conn:
+            member = self._member(conn, campaign_id, user_id)
+            if member["role"] != "player":
+                raise CampaignError(403, "Somente jogadores desvinculam personagens.")
+            conn.execute(
+                "UPDATE members SET character_id = NULL WHERE campaign_id = ? AND user_id = ?",
+                (campaign_id, user_id),
+            )
+            return self._summary(self._member(conn, campaign_id, user_id))
+
     @staticmethod
     def _entry(row: sqlite3.Row) -> dict:
         return {
@@ -393,3 +404,15 @@ class CampaignStore:
                 "SELECT * FROM journal_entries WHERE id = ?", (entry_id,)
             ).fetchone()
             return self._entry(row)
+
+    def delete_entry(self, user_id: str, campaign_id: str, entry_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode excluir notas.")
+            deleted = conn.execute(
+                "DELETE FROM journal_entries WHERE id = ? AND campaign_id = ?",
+                (entry_id, campaign_id),
+            )
+            if deleted.rowcount == 0:
+                raise CampaignError(404, "Nota não encontrada.")
+

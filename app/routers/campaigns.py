@@ -139,6 +139,11 @@ def link_character(campaign_id: str, body: CharacterBody, user: User, store: Sto
     return store.link_character(user["id"], campaign_id, body.characterId)
 
 
+@router.delete("/campaigns/{campaign_id}/character")
+def unlink_character(campaign_id: str, user: User, store: Store):
+    return store.unlink_character(user["id"], campaign_id)
+
+
 @router.get("/campaigns/{campaign_id}/entries")
 def list_entries(campaign_id: str, user: User, store: Store):
     return store.list_entries(user["id"], campaign_id)
@@ -158,3 +163,10 @@ def update_entry(
     return store.update_entry(
         user["id"], campaign_id, entry_id, body.title, body.body, body.visibility
     )
+
+
+@router.delete("/campaigns/{campaign_id}/entries/{entry_id}", status_code=204)
+def delete_entry(campaign_id: str, entry_id: str, user: User, store: Store):
+    store.delete_entry(user["id"], campaign_id, entry_id)
+    return Response(status_code=204)
+
