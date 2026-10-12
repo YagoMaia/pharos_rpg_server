@@ -230,6 +230,77 @@ class CampaignApiTests(unittest.TestCase):
             200,
         )
 
+    def test_table_login_uses_fixed_names_and_keeps_new_accounts_separate(self):
+        roster = (
+            "Gabriel",
+            "Leandro",
+            "Yago",
+            "Luiz",
+            "Amom",
+            "Victor",
+            "Wayne",
+            "Visitante",
+        )
+        for name in roster:
+            response = self.client.post(
+                "/auth/table-login", json={"name": name, "pin": name.lower()}
+            )
+            self.assertEqual(response.status_code, 200, name)
+            token = response.json()["accessToken"]
+            self.assertEqual(self.store.user_for_token(token)["display_name"], name)
+            self.assertEqual(
+                self.client.get(
+                    "/campaigns", headers={"Authorization": f"Bearer {token}"}
+                ).json(),
+                [],
+            )
+        for name, pin in (
+            ("Victor", "wrong"),
+            ("Outro", "outro"),
+            ("Visitante", "VISITANTE"),
+        ):
+            self.assertEqual(
+                self.client.post(
+                    "/auth/table-login", json={"name": name, "pin": pin}
+                ).status_code,
+                401,
+            )
+
+        victor = self.client.post(
+            "/auth/table-login", json={"name": "Victor", "pin": "victor"}
+        ).json()["accessToken"]
+        campaign_id = self.campaign({"Authorization": f"Bearer {victor}"})["id"]
+        returning = self.client.post(
+            "/auth/table-login", json={"name": "Victor", "pin": "victor"}
+        ).json()["accessToken"]
+        self.assertEqual(
+            self.client.get(
+                "/campaigns", headers={"Authorization": f"Bearer {returning}"}
+            ).json()[0]["id"],
+            campaign_id,
+        )
+
+    def test_table_accounts_do_not_reuse_existing_email_accounts(self):
+        old_account = self.register("old@example.com", "Victor")
+        table_token = self.client.post(
+            "/auth/table-login", json={"name": "Victor", "pin": "victor"}
+        ).json()["accessToken"]
+        self.assertNotEqual(
+            self.store.user_for_token(old_account["Authorization"].split()[1])["id"],
+            self.store.user_for_token(table_token)["id"],
+        )
+
+    def test_only_victor_can_create_campaign_in_table_mode(self):
+        player_token = self.client.post(
+            "/auth/table-login", json={"name": "Gabriel", "pin": "gabriel"}
+        ).json()["accessToken"]
+        response = self.client.post(
+            "/campaigns",
+            json={"name": "Mesa"},
+            headers={"Authorization": f"Bearer {player_token}"},
+        )
+        self.assertEqual(response.status_code, 403)
+
     def test_character_id_cannot_be_claimed_by_another_member(self):
         gm = self.register("gm@example.com")
         first = self.register("first@example.com")

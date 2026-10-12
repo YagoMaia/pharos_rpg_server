@@ -25,6 +25,18 @@ def _password_hash(password: str, salt: bytes) -> str:
     return f"{salt.hex()}:{digest.hex()}"
 
 
+TABLE_NAMES = (
+    "Gabriel",
+    "Leandro",
+    "Yago",
+    "Luiz",
+    "Amom",
+    "Victor",
+    "Wayne",
+    "Visitante",
+)
+
+
 class CampaignStore:
     def __init__(self, path: str | Path):
         self.path = str(path)
@@ -33,6 +45,9 @@ class CampaignStore:
                 CREATE TABLE IF NOT EXISTS users (
                     id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE,
                     display_name TEXT NOT NULL, password_hash TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS table_users (
+                    name TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE REFERENCES users(id)
                 );
                 CREATE TABLE IF NOT EXISTS tokens (
                     hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
@@ -113,6 +128,35 @@ class CampaignStore:
                 raise CampaignError(401, "Credenciais inválidas.")
             return self._issue_token(conn, user["id"])
 
+    def table_login(self, name: str, pin: str) -> str:
+        """Emite token para a lista fixa da mesa; o PIN público evita apenas erros casuais."""
+        canonical = next(
+            (entry for entry in TABLE_NAMES if entry.lower() == name.strip().lower()),
+            None,
+        )
+        if not canonical or not secrets.compare_digest(pin, canonical.lower()):
+            raise CampaignError(401, "Nome ou PIN inválidos.")
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT user_id FROM table_users WHERE name = ?", (canonical,)
+            ).fetchone()
+            if row:
+                return self._issue_token(conn, row["user_id"])
+            user_id = str(uuid4())
+            salt = secrets.token_bytes(16)
+            conn.execute(
+                "INSERT INTO users VALUES (?, ?, ?, ?)",
+                (
+                    user_id,
+                    f"{user_id}@table.invalid",
+                    canonical,
+                    _password_hash(secrets.token_urlsafe(32), salt),
+                ),
+            )
+            conn.execute("INSERT INTO table_users VALUES (?, ?)", (canonical, user_id))
+            return self._issue_token(conn, user_id)
+
     def user_for_token(self, token: str) -> dict | None:
         with closing(self._connect()) as conn:
             row = conn.execute(
@@ -174,6 +218,11 @@ class CampaignStore:
     def create_campaign(self, user_id: str, name: str) -> dict:
         campaign_id = str(uuid4())
         with closing(self._connect()) as conn, conn:
+            table_user = conn.execute(
+                "SELECT name FROM table_users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if table_user and table_user["name"] != "Victor":
+                raise CampaignError(403, "Apenas Victor pode criar campanhas da mesa.")
             conn.execute(
                 "INSERT INTO campaigns VALUES (?, ?, ?)",
                 (campaign_id, name.strip(), user_id),

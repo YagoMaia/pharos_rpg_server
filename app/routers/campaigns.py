@@ -51,6 +51,11 @@ class LoginBody(BaseModel):
     password: str
 
 
+class TableLoginBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    pin: str = Field(min_length=1, max_length=80)
+
+
 class CampaignBody(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     name: str = Field(min_length=1, max_length=80)
@@ -85,6 +90,11 @@ def register(body: RegisterBody, store: Store):
 @router.post("/auth/login")
 def login(body: LoginBody, store: Store):
     return {"accessToken": store.login(body.email, body.password)}
+
+
+@router.post("/auth/table-login")
+def table_login(body: TableLoginBody, store: Store):
+    return {"accessToken": store.table_login(body.name, body.pin)}
 
 
 @router.post("/auth/logout", status_code=204)
