@@ -3,6 +3,7 @@
 from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
+import json
 from pathlib import Path
 import secrets
 import sqlite3
@@ -60,7 +61,9 @@ class CampaignStore:
                     campaign_id TEXT NOT NULL REFERENCES campaigns(id),
                     user_id TEXT NOT NULL REFERENCES users(id),
                     role TEXT NOT NULL CHECK (role IN ('gm', 'player')),
-                    character_id TEXT, PRIMARY KEY (campaign_id, user_id)
+                    character_id TEXT,
+                    character_data TEXT,
+                    PRIMARY KEY (campaign_id, user_id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS member_character ON members(campaign_id, character_id)
                     WHERE character_id IS NOT NULL;
@@ -77,7 +80,37 @@ class CampaignStore:
                 );
                 CREATE INDEX IF NOT EXISTS journal_campaign_recent
                     ON journal_entries(campaign_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS campaign_sessions (
+                    id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    session_number INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '',
+                    scheduled_at TEXT,
+                    status TEXT NOT NULL CHECK (status IN ('planned', 'active', 'completed')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_sessions_campaign
+                    ON campaign_sessions(campaign_id, session_number ASC);
+                CREATE TABLE IF NOT EXISTS campaign_quests (
+                    id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    reward TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'failed')),
+                    visibility TEXT NOT NULL CHECK (visibility IN ('party', 'gm')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_quests_campaign
+                    ON campaign_quests(campaign_id, created_at DESC);
             """)
+            # Migration segura para character_data em bases SQLite já criadas
+            cols = [row["name"] for row in conn.execute("PRAGMA table_info(members)").fetchall()]
+            if "character_data" not in cols:
+                conn.execute("ALTER TABLE members ADD COLUMN character_data TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5)
@@ -228,7 +261,8 @@ class CampaignStore:
                 (campaign_id, name.strip(), user_id),
             )
             conn.execute(
-                "INSERT INTO members VALUES (?, ?, 'gm', NULL)", (campaign_id, user_id)
+                "INSERT INTO members (campaign_id, user_id, role, character_id, character_data) VALUES (?, ?, 'gm', NULL, NULL)",
+                (campaign_id, user_id),
             )
         return {
             "id": campaign_id,
@@ -251,7 +285,7 @@ class CampaignStore:
         with closing(self._connect()) as conn:
             campaign = self._summary(self._member(conn, campaign_id, user_id))
             rows = conn.execute(
-                """SELECT users.id, users.display_name, members.role, members.character_id
+                """SELECT users.id, users.display_name, members.role, members.character_id, members.character_data
                 FROM members JOIN users ON users.id = members.user_id
                 WHERE members.campaign_id = ? ORDER BY members.role, users.display_name""",
                 (campaign_id,),
@@ -262,6 +296,7 @@ class CampaignStore:
                     "name": row["display_name"],
                     "role": row["role"],
                     "characterId": row["character_id"],
+                    "hasSheet": bool(row["character_data"]) if row["character_data"] else False,
                 }
                 for row in rows
             ]
@@ -304,7 +339,7 @@ class CampaignStore:
             if exists:
                 raise CampaignError(409, "Você já participa da campanha.")
             conn.execute(
-                "INSERT INTO members VALUES (?, ?, 'player', NULL)",
+                "INSERT INTO members (campaign_id, user_id, role, character_id, character_data) VALUES (?, ?, 'player', NULL, NULL)",
                 (invite["campaign_id"], user_id),
             )
             conn.execute(
@@ -313,15 +348,24 @@ class CampaignStore:
             )
             return self._summary(self._member(conn, invite["campaign_id"], user_id))
 
-    def link_character(self, user_id: str, campaign_id: str, character_id: str) -> dict:
+    def link_character(
+        self,
+        user_id: str,
+        campaign_id: str,
+        character_id: str,
+        character_data: dict | None = None,
+    ) -> dict:
         with closing(self._connect()) as conn, conn:
             member = self._member(conn, campaign_id, user_id)
             if member["role"] != "player":
                 raise CampaignError(403, "Somente jogadores vinculam personagens.")
+            serialized = json.dumps(character_data) if character_data is not None else None
             try:
                 conn.execute(
-                    "UPDATE members SET character_id = ? WHERE campaign_id = ? AND user_id = ?",
-                    (character_id.strip(), campaign_id, user_id),
+                    """UPDATE members
+                    SET character_id = ?, character_data = COALESCE(?, character_data)
+                    WHERE campaign_id = ? AND user_id = ?""",
+                    (character_id.strip(), serialized, campaign_id, user_id),
                 )
             except sqlite3.IntegrityError as exc:
                 raise CampaignError(
@@ -335,10 +379,39 @@ class CampaignStore:
             if member["role"] != "player":
                 raise CampaignError(403, "Somente jogadores desvinculam personagens.")
             conn.execute(
-                "UPDATE members SET character_id = NULL WHERE campaign_id = ? AND user_id = ?",
+                "UPDATE members SET character_id = NULL, character_data = NULL WHERE campaign_id = ? AND user_id = ?",
                 (campaign_id, user_id),
             )
             return self._summary(self._member(conn, campaign_id, user_id))
+
+    def sync_character(self, user_id: str, campaign_id: str, character_data: dict) -> dict:
+        with closing(self._connect()) as conn, conn:
+            member = self._member(conn, campaign_id, user_id)
+            if member["role"] != "player":
+                raise CampaignError(403, "Somente jogadores sincronizam fichas.")
+            conn.execute(
+                "UPDATE members SET character_data = ? WHERE campaign_id = ? AND user_id = ?",
+                (json.dumps(character_data), campaign_id, user_id),
+            )
+            return self._summary(self._member(conn, campaign_id, user_id))
+
+    def get_member_sheet(self, user_id: str, campaign_id: str, target_user_id: str) -> dict:
+        with closing(self._connect()) as conn:
+            member = self._member(conn, campaign_id, user_id)
+            if user_id != target_user_id and member["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre ou o próprio jogador podem inspecionar a ficha.")
+            target = conn.execute(
+                "SELECT character_id, character_data FROM members WHERE campaign_id = ? AND user_id = ?",
+                (campaign_id, target_user_id),
+            ).fetchone()
+            if not target:
+                raise CampaignError(404, "Membro não encontrado.")
+            raw = target["character_data"]
+            parsed = json.loads(raw) if raw else None
+            return {
+                "characterId": target["character_id"],
+                "characterData": parsed,
+            }
 
     @staticmethod
     def _entry(row: sqlite3.Row) -> dict:
@@ -415,4 +488,218 @@ class CampaignStore:
             )
             if deleted.rowcount == 0:
                 raise CampaignError(404, "Nota não encontrada.")
+
+    @staticmethod
+    def _session(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "campaignId": row["campaign_id"],
+            "sessionNumber": row["session_number"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "scheduledAt": row["scheduled_at"],
+            "status": row["status"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def list_sessions(self, user_id: str, campaign_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            self._member(conn, campaign_id, user_id)
+            rows = conn.execute(
+                """SELECT * FROM campaign_sessions
+                WHERE campaign_id = ?
+                ORDER BY session_number ASC, created_at ASC""",
+                (campaign_id,),
+            ).fetchall()
+            return [self._session(row) for row in rows]
+
+    def create_session(
+        self,
+        user_id: str,
+        campaign_id: str,
+        session_number: int,
+        title: str,
+        summary: str = "",
+        scheduled_at: str | None = None,
+        status: str = "planned",
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode gerenciar sessões.")
+            session_id = str(uuid4())
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """INSERT INTO campaign_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    campaign_id,
+                    session_number,
+                    title.strip(),
+                    summary.strip(),
+                    scheduled_at,
+                    status,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM campaign_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return self._session(row)
+
+    def update_session(
+        self,
+        user_id: str,
+        campaign_id: str,
+        session_id: str,
+        session_number: int,
+        title: str,
+        summary: str = "",
+        scheduled_at: str | None = None,
+        status: str = "planned",
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode editar sessões.")
+            now = datetime.now(timezone.utc).isoformat()
+            updated = conn.execute(
+                """UPDATE campaign_sessions
+                SET session_number = ?, title = ?, summary = ?, scheduled_at = ?, status = ?, updated_at = ?
+                WHERE id = ? AND campaign_id = ?""",
+                (
+                    session_number,
+                    title.strip(),
+                    summary.strip(),
+                    scheduled_at,
+                    status,
+                    now,
+                    session_id,
+                    campaign_id,
+                ),
+            )
+            if updated.rowcount == 0:
+                raise CampaignError(404, "Sessão não encontrada.")
+            row = conn.execute(
+                "SELECT * FROM campaign_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return self._session(row)
+
+    def delete_session(self, user_id: str, campaign_id: str, session_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode excluir sessões.")
+            deleted = conn.execute(
+                "DELETE FROM campaign_sessions WHERE id = ? AND campaign_id = ?",
+                (session_id, campaign_id),
+            )
+            if deleted.rowcount == 0:
+                raise CampaignError(404, "Sessão não encontrada.")
+
+    @staticmethod
+    def _quest(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "campaignId": row["campaign_id"],
+            "title": row["title"],
+            "description": row["description"],
+            "reward": row["reward"],
+            "status": row["status"],
+            "visibility": row["visibility"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def list_quests(self, user_id: str, campaign_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            role = self._member(conn, campaign_id, user_id)["role"]
+            rows = conn.execute(
+                """SELECT * FROM campaign_quests
+                WHERE campaign_id = ? AND (visibility = 'party' OR ? = 'gm')
+                ORDER BY created_at DESC, id DESC""",
+                (campaign_id, role),
+            ).fetchall()
+            return [self._quest(row) for row in rows]
+
+    def create_quest(
+        self,
+        user_id: str,
+        campaign_id: str,
+        title: str,
+        description: str = "",
+        reward: str = "",
+        visibility: str = "party",
+        status: str = "active",
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode gerenciar missões.")
+            quest_id = str(uuid4())
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """INSERT INTO campaign_quests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    quest_id,
+                    campaign_id,
+                    title.strip(),
+                    description.strip(),
+                    reward.strip(),
+                    status,
+                    visibility,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM campaign_quests WHERE id = ?", (quest_id,)
+            ).fetchone()
+            return self._quest(row)
+
+    def update_quest(
+        self,
+        user_id: str,
+        campaign_id: str,
+        quest_id: str,
+        title: str,
+        description: str = "",
+        reward: str = "",
+        visibility: str = "party",
+        status: str = "active",
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode editar missões.")
+            now = datetime.now(timezone.utc).isoformat()
+            updated = conn.execute(
+                """UPDATE campaign_quests
+                SET title = ?, description = ?, reward = ?, visibility = ?, status = ?, updated_at = ?
+                WHERE id = ? AND campaign_id = ?""",
+                (
+                    title.strip(),
+                    description.strip(),
+                    reward.strip(),
+                    visibility,
+                    status,
+                    now,
+                    quest_id,
+                    campaign_id,
+                ),
+            )
+            if updated.rowcount == 0:
+                raise CampaignError(404, "Missão não encontrada.")
+            row = conn.execute(
+                "SELECT * FROM campaign_quests WHERE id = ?", (quest_id,)
+            ).fetchone()
+            return self._quest(row)
+
+    def delete_quest(self, user_id: str, campaign_id: str, quest_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode excluir missões.")
+            deleted = conn.execute(
+                "DELETE FROM campaign_quests WHERE id = ? AND campaign_id = ?",
+                (quest_id, campaign_id),
+            )
+            if deleted.rowcount == 0:
+                raise CampaignError(404, "Missão não encontrada.")
 
