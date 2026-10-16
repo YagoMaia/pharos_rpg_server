@@ -6,7 +6,14 @@ from app.models.domain import ActiveCondition, Combatant, CombatSession
 from app.models.events import (
     ApplyConditionPayload,
     RemoveConditionPayload,
+    RequestSavingThrowPayload,
     ResolveActionPayload,
+    SubmitSavingThrowPayload,
+)
+from app.services.combat_utils import (
+    calculate_area_damage,
+    get_target_save_modifier,
+    resolve_saving_throw,
 )
 from app.services.gm_service import GMService
 
@@ -15,8 +22,11 @@ class PlayerService:
     @staticmethod
     def _sync_sheet(existing: Combatant, incoming: Combatant):
         """Sincroniza a ficha sem restaurar recursos, ações ou testes de morte."""
+
         def stance_bonus(actor):
-            stance = next((s for s in actor.stances if s.id == actor.activeStanceId), None)
+            stance = next(
+                (s for s in actor.stances if s.id == actor.activeStanceId), None
+            )
             if not stance:
                 return 0
             attribute = actor.attributes.get(stance.acAttribute)
@@ -32,8 +42,17 @@ class PlayerService:
         if new_base is None:
             new_base = incoming.armorClass - stance_bonus(incoming)
 
-        for field in ("attributes", "stances", "skills", "spells", "weapons", "image",
-                      "feats", "factionFeat", "specialFeat"):
+        for field in (
+            "attributes",
+            "stances",
+            "skills",
+            "spells",
+            "weapons",
+            "image",
+            "feats",
+            "factionFeat",
+            "specialFeat",
+        ):
             setattr(existing, field, getattr(incoming, field))
         if not any(s.id == existing.activeStanceId for s in existing.stances):
             existing.activeStanceId = None
@@ -77,11 +96,15 @@ class PlayerService:
                 state.combatants[pet_combatant.id] = pet_combatant
                 if pet_combatant.id not in state.turn_order:
                     state.turn_order.append(pet_combatant.id)
-                state.logs.append(f"🐾 {pet_combatant.name} entrou no combate como companheiro.")
+                state.logs.append(
+                    f"🐾 {pet_combatant.name} entrou no combate como companheiro."
+                )
 
         # Reordena por iniciativa
         state.turn_order.sort(
-            key=lambda x: state.combatants[x].initiative if x in state.combatants else 0,
+            key=lambda x: state.combatants[x].initiative
+            if x in state.combatants
+            else 0,
             reverse=True,
         )
 
@@ -127,11 +150,18 @@ class PlayerService:
         combatant = state.combatants.get(c_id)
 
         if combatant:
-            old_stance = next((s for s in combatant.stances if s.id == combatant.activeStanceId), None)
+            old_stance = next(
+                (s for s in combatant.stances if s.id == combatant.activeStanceId), None
+            )
             new_stance = next((s for s in combatant.stances if s.id == s_id), None)
-            if s_id is not None and (new_stance is None or not combatant.turnActions.bonus):
+            if s_id is not None and (
+                new_stance is None or not combatant.turnActions.bonus
+            ):
                 return
-            if any(c.name in {"Incapacitado", "Paralisado", "Atordoado"} for c in combatant.conditions):
+            if any(
+                c.name in {"Incapacitado", "Paralisado", "Atordoado"}
+                for c in combatant.conditions
+            ):
                 return
             if s_id == combatant.activeStanceId:
                 return
@@ -142,7 +172,9 @@ class PlayerService:
                 attribute = combatant.attributes.get(stance.acAttribute)
                 return (stance.acBonus or 0) + (attribute.modifier if attribute else 0)
 
-            new_ac = combatant.armorClass - armor_bonus(old_stance) + armor_bonus(new_stance)
+            new_ac = (
+                combatant.armorClass - armor_bonus(old_stance) + armor_bonus(new_stance)
+            )
             if s_id is None:
                 log_msg = f"{combatant.name} assumiu a postura Neutra (CA {new_ac})."
                 combatant.activeStanceId = None
@@ -199,29 +231,43 @@ class PlayerService:
                         state.logs.append(f"{next_actor.name} aguarda a próxima fase.")
                         continue
                     state.logs.append(f"💀 {next_actor.name} removido.")
-                    await GMService.remove_combatant(state, {"combatantId": next_actor.id})
+                    await GMService.remove_combatant(
+                        state, {"combatantId": next_actor.id}
+                    )
                     # A remoção deslocou o próximo ator para o índice atual.
                     state.turn_index -= 1
                     continue
                 if next_actor.type == "pet":
-                    state.logs.append(f"🐾 {next_actor.name} está inconsciente e pulou o turno.")
+                    state.logs.append(
+                        f"🐾 {next_actor.name} está inconsciente e pulou o turno."
+                    )
                     continue
                 if (
                     next_actor.deathSaves.failures >= 3
                     or next_actor.deathSaves.successes >= 3
                 ):
                     status = (
-                        "morto" if next_actor.deathSaves.failures >= 3 else "estabilizado"
+                        "morto"
+                        if next_actor.deathSaves.failures >= 3
+                        else "estabilizado"
                     )
-                    state.logs.append(f"⚰️ {next_actor.name} está {status} e pulou o turno.")
+                    state.logs.append(
+                        f"⚰️ {next_actor.name} está {status} e pulou o turno."
+                    )
                     continue
             break  # Combatente valido encontrado
         else:
             state.logs.append("💀 Todos os combatentes estão incapacitados.")
             state.turn_index = -1
-            await manager.broadcast_event(state.session_id, "TURN_UPDATE", {
-                "newActiveId": None, "turnIndex": -1, "log": state.logs[-1],
-            })
+            await manager.broadcast_event(
+                state.session_id,
+                "TURN_UPDATE",
+                {
+                    "newActiveId": None,
+                    "turnIndex": -1,
+                    "log": state.logs[-1],
+                },
+            )
             return
 
         # Lógica de Inconsciência
@@ -249,7 +295,10 @@ class PlayerService:
                     continue
             remaining_conditions.append(cond)
 
-        if any(c.name in {"Incapacitado", "Paralisado", "Atordoado"} for c in remaining_conditions):
+        if any(
+            c.name in {"Incapacitado", "Paralisado", "Atordoado"}
+            for c in remaining_conditions
+        ):
             next_actor.turnActions.standard = False
             next_actor.turnActions.bonus = False
             next_actor.turnActions.reaction = False
@@ -293,7 +342,8 @@ class PlayerService:
         if not attacker:
             return
         if attacker.hp.current <= 0 or any(
-            c.name in {"Incapacitado", "Paralisado", "Atordoado"} for c in attacker.conditions
+            c.name in {"Incapacitado", "Paralisado", "Atordoado"}
+            for c in attacker.conditions
         ):
             return
 
@@ -347,17 +397,23 @@ class PlayerService:
                     healed = target.hp.current - old_hp
                     log_parts.append(f"{healed} PV curados em {target.name}")
 
-                results.append({
-                    "targetId": target.id,
-                    "targetHp": target.hp.current,
-                    "type": event_type,
-                    "value": damage_done if event_type == "damage" else healed,
-                })
+                results.append(
+                    {
+                        "targetId": target.id,
+                        "targetHp": target.hp.current,
+                        "type": event_type,
+                        "value": damage_done if event_type == "damage" else healed,
+                    }
+                )
 
             if log_parts:
-                final_log = f"{attacker.name} usou {data.actionName}: {', '.join(log_parts)}."
+                final_log = (
+                    f"{attacker.name} usou {data.actionName}: {', '.join(log_parts)}."
+                )
             else:
-                final_log = f"{attacker.name} usou {data.actionName} (sem alvos válidos)."
+                final_log = (
+                    f"{attacker.name} usou {data.actionName} (sem alvos válidos)."
+                )
 
             # Aplica condições (multi-target)
             applied_cond_logs = PlayerService._apply_conditions_from_action(
@@ -466,7 +522,9 @@ class PlayerService:
             )
             target.conditions.append(condition)
 
-            duration_text = f" por {cp.durationTurns} turnos" if cp.durationTurns else ""
+            duration_text = (
+                f" por {cp.durationTurns} turnos" if cp.durationTurns else ""
+            )
             logs.append(f"⚡ {target.name} ficou {cp.conditionName}{duration_text}!")
 
         return logs
@@ -541,7 +599,9 @@ class PlayerService:
         )
         combatant.conditions.append(condition)
 
-        duration_text = f" por {data.durationTurns} turnos" if data.durationTurns else ""
+        duration_text = (
+            f" por {data.durationTurns} turnos" if data.durationTurns else ""
+        )
         log_msg = f"🎯 {combatant.name} recebeu a condição {data.conditionName}{duration_text}."
         state.logs.append(log_msg)
 
@@ -576,7 +636,9 @@ class PlayerService:
         if not removed:
             return
 
-        combatant.conditions = [c for c in combatant.conditions if c.id != data.conditionId]
+        combatant.conditions = [
+            c for c in combatant.conditions if c.id != data.conditionId
+        ]
 
         log_msg = f"✨ {combatant.name} não está mais {removed.name}."
         state.logs.append(log_msg)
@@ -590,6 +652,144 @@ class PlayerService:
                 "combatantId": data.combatantId,
                 "conditions": [c.model_dump() for c in combatant.conditions],
                 "removed": removed.model_dump(),
+                "log": log_msg,
+            },
+        )
+
+    @staticmethod
+    @static_method_log
+    async def request_saving_throw(state: CombatSession, payload: dict):
+        """Dispara solicitação de salvaguarda para múltiplos alvos (ataques em área)."""
+        data = RequestSavingThrowPayload(**payload)
+        attacker = state.combatants.get(data.attackerId)
+        if not attacker:
+            return
+
+        if attacker.hp.current <= 0 or any(
+            c.name in {"Incapacitado", "Paralisado", "Atordoado"}
+            for c in attacker.conditions
+        ):
+            return
+
+        if data.costType != "none":
+            cost_attr = (
+                "standard"
+                if data.costType == "standard"
+                else "bonus"
+                if data.costType == "bonus"
+                else "reaction"
+            )
+            if not getattr(attacker.turnActions, cost_attr):
+                return
+            if data.focusCost > attacker.focus.current:
+                state.logs.append(f"{attacker.name} sem foco para {data.actionName}.")
+                return
+
+        request_id = data.requestId or uuid.uuid4().hex
+        valid_targets = [t_id for t_id in data.targetIds if t_id in state.combatants]
+        if not valid_targets:
+            return
+
+        log_msg = (
+            f"⚠️ {attacker.name} exigiu salvaguarda de {data.attribute} (CD {data.saveDC}) "
+            f"para {data.actionName} contra {len(valid_targets)} alvo(s)!"
+        )
+        state.logs.append(log_msg)
+
+        from app.managers.connection import manager
+
+        await manager.broadcast_event(
+            state.session_id,
+            "REQUEST_SAVING_THROW",
+            {
+                "requestId": request_id,
+                "attackerId": attacker.id,
+                "attackerName": attacker.name,
+                "actionName": data.actionName,
+                "attribute": data.attribute,
+                "saveDC": data.saveDC,
+                "baseDamage": data.baseDamage,
+                "halfOnSave": data.halfOnSave,
+                "targetIds": valid_targets,
+                "costType": data.costType,
+                "focusCost": data.focusCost,
+                "log": log_msg,
+            },
+        )
+
+    @staticmethod
+    @static_method_log
+    async def submit_saving_throw(state: CombatSession, payload: dict):
+        """Processa a rolagem de salvaguarda de um alvo e dispara SAVING_THROW_ROLLED."""
+        data = SubmitSavingThrowPayload(**payload)
+        target = state.combatants.get(data.combatantId)
+        if not target:
+            return
+
+        modifier = 0
+        is_crit_success = data.rollValue == 20
+        is_crit_fail = data.rollValue == 1
+
+        if data.attribute and data.saveDC is not None:
+            res = resolve_saving_throw(
+                target, data.attribute, data.saveDC, data.rollValue
+            )
+            modifier = res["modifier"]
+            total = res["total"]
+            passed = res["passed"]
+            is_crit_success = res["is_crit_success"]
+            is_crit_fail = res["is_crit_fail"]
+        else:
+            modifier = (
+                get_target_save_modifier(target, data.attribute)
+                if data.attribute
+                else 0
+            )
+            total = data.rollValue + modifier
+            passed = (
+                data.passed
+                if data.passed is not None
+                else (
+                    is_crit_success
+                    or (not is_crit_fail and total >= (data.saveDC or 10))
+                )
+            )
+
+        damage_amount = data.damageAmount
+        if damage_amount is None:
+            base_damage = data.baseDamage or 0
+            half_on_save = data.halfOnSave if data.halfOnSave is not None else True
+            damage_amount = calculate_area_damage(base_damage, passed, half_on_save)
+
+        if data.applyDamage and damage_amount > 0:
+            target.hp.current = max(0, target.hp.current - damage_amount)
+
+        res_str = "SUCESSO" if passed else "FALHA"
+        attr_label = data.attribute or "Salvaguarda"
+        log_msg = (
+            f"🎲 {target.name} rolou salvaguarda de {attr_label}: "
+            f"{data.rollValue} + {modifier} = {total} ({res_str})"
+            f"{f' sofrerá {damage_amount} de dano' if damage_amount > 0 else ''}."
+        )
+        state.logs.append(log_msg)
+
+        from app.managers.connection import manager
+
+        await manager.broadcast_event(
+            state.session_id,
+            "SAVING_THROW_ROLLED",
+            {
+                "requestId": data.requestId,
+                "combatantId": target.id,
+                "combatantName": target.name,
+                "rollValue": data.rollValue,
+                "modifier": modifier,
+                "total": total,
+                "passed": passed,
+                "isCritSuccess": is_crit_success,
+                "isCritFail": is_crit_fail,
+                "damageAmount": damage_amount,
+                "currentHp": target.hp.current,
                 "log": log_msg,
             },
         )

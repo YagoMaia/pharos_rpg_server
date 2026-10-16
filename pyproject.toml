@@ -11,3 +11,12 @@ dependencies = [
     "uvicorn[standard]>=0.40.0",
     "websockets>=16.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
