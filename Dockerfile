@@ -14,9 +14,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Instala dependências Python
+# Instala dependências Python com cache de buildkit, timeout estendido e retries resilientes
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && \
+    pip install --default-timeout=120 --retries 10 --prefer-binary -r requirements.txt
 
 # Copia código da aplicação
 COPY app ./app
@@ -27,6 +29,6 @@ RUN mkdir -p /data
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8000/ || exit 1
+  CMD curl --fail --silent --show-error http://127.0.0.1:8000/health || exit 1
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

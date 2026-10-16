@@ -35,6 +35,11 @@ class CampaignApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.text)
         return {"Authorization": f"Bearer {response.json()['accessToken']}"}
 
+    def test_health_endpoint_reports_ready(self):
+        response = self.client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
     def campaign(self, owner):
         response = self.client.post(
             "/campaigns", headers=owner, json={"name": "Pharos"}
