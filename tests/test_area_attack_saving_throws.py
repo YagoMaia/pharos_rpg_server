@@ -151,17 +151,58 @@ class TestAreaAttackSavingThrowsWS(unittest.IsolatedAsyncioTestCase):
                 identity,
             )
 
-        self.assertEqual(len(mock_manager.events), 1)
-        event_type, event_payload = mock_manager.events[0]
-        self.assertEqual(event_type, "REQUEST_SAVING_THROW")
+        self.assertEqual(len(mock_manager.events), 2)
+        event_types = [e[0] for e in mock_manager.events]
+        self.assertIn("REQUEST_SAVING_THROW", event_types)
+        self.assertIn("SAVING_THROW_REQUESTED", event_types)
+        event_payload = mock_manager.events[0][1]
         self.assertEqual(event_payload["attackerId"], "caster")
         self.assertEqual(event_payload["actionName"], "Bola de Fogo")
         self.assertEqual(event_payload["attribute"], "Destreza")
+        self.assertEqual(event_payload["saveAttribute"], "Destreza")
         self.assertEqual(event_payload["saveDC"], 14)
         self.assertEqual(event_payload["baseDamage"], 28)
         self.assertTrue(event_payload["halfOnSave"])
         self.assertEqual(event_payload["targetIds"], ["t1", "t2"])
         self.assertIn("requestId", event_payload)
+        self.assertEqual(event_payload["requestId"], event_payload["attackId"])
+
+    async def test_request_saving_throw_with_frontend_aliases(self):
+        attacker = make_actor("caster")
+        target1 = make_actor("t1")
+        state = make_session(attacker, target1)
+        mock_manager = MemoryManagerMock(state)
+
+        engine = GameLogic(mock_manager)
+        frontend_payload = {
+            "attackId": "area_999",
+            "attackerId": "caster",
+            "attackerName": "Mago",
+            "actionName": "Sopro de Gelo",
+            "saveAttribute": "Constituição",
+            "saveDC": 13,
+            "baseDamage": 15,
+            "halfOnSave": True,
+            "targetIds": ["t1"],
+        }
+
+        identity = {
+            "role": "player",
+            "client_id": "owner-caster",
+        }
+        with patch("app.managers.connection.manager", mock_manager):
+            await engine.handle_message(
+                state.session_id,
+                {"type": "REQUEST_SAVING_THROW", "payload": frontend_payload},
+                identity,
+            )
+
+        self.assertEqual(len(mock_manager.events), 2)
+        event_payload = mock_manager.events[0][1]
+        self.assertEqual(event_payload["attribute"], "Constituição")
+        self.assertEqual(event_payload["saveAttribute"], "Constituição")
+        self.assertEqual(event_payload["requestId"], "area_999")
+        self.assertEqual(event_payload["attackId"], "area_999")
 
     async def test_request_saving_throw_fails_if_unauthorized(self):
         attacker = make_actor("caster")
@@ -219,16 +260,58 @@ class TestAreaAttackSavingThrowsWS(unittest.IsolatedAsyncioTestCase):
                 identity,
             )
 
-        self.assertEqual(len(mock_manager.events), 1)
-        event_type, event_payload = mock_manager.events[0]
-        self.assertEqual(event_type, "SAVING_THROW_ROLLED")
+        self.assertEqual(len(mock_manager.events), 2)
+        event_types = [e[0] for e in mock_manager.events]
+        self.assertIn("SAVING_THROW_ROLLED", event_types)
+        self.assertIn("SAVING_THROW_SUBMITTED", event_types)
+        event_payload = mock_manager.events[0][1]
         self.assertEqual(event_payload["requestId"], "req-123")
+        self.assertEqual(event_payload["attackId"], "req-123")
         self.assertEqual(event_payload["combatantId"], "t1")
+        self.assertEqual(event_payload["targetId"], "t1")
         self.assertEqual(event_payload["rollValue"], 10)
+        self.assertEqual(event_payload["roll"], 10)
         self.assertEqual(event_payload["modifier"], 3)
         self.assertEqual(event_payload["total"], 13)
         self.assertFalse(event_payload["passed"])
         self.assertEqual(event_payload["damageAmount"], 20)
+
+    async def test_submit_saving_throw_with_frontend_format(self):
+        attacker = make_actor("caster")
+        target1 = make_actor("t1")  # Destreza mod = 3
+        state = make_session(attacker, target1)
+        mock_manager = MemoryManagerMock(state)
+
+        engine = GameLogic(mock_manager)
+        frontend_payload = {
+            "attackId": "area_555",
+            "targetId": "t1",
+            "targetName": "Target 1",
+            "roll": 18,
+            "total": 21,
+            "passed": True,
+            "damageAmount": 10,
+        }
+
+        identity = {
+            "role": "player",
+            "client_id": "owner-t1",
+        }
+        with patch("app.managers.connection.manager", mock_manager):
+            await engine.handle_message(
+                state.session_id,
+                {"type": "SUBMIT_SAVING_THROW", "payload": frontend_payload},
+                identity,
+            )
+
+        self.assertEqual(len(mock_manager.events), 2)
+        event_payload = mock_manager.events[0][1]
+        self.assertEqual(event_payload["attackId"], "area_555")
+        self.assertEqual(event_payload["targetId"], "t1")
+        self.assertEqual(event_payload["roll"], 18)
+        self.assertEqual(event_payload["total"], 21)
+        self.assertTrue(event_payload["passed"])
+        self.assertEqual(event_payload["damageAmount"], 10)
 
     async def test_submit_saving_throw_with_success_and_half_damage(self):
         attacker = make_actor("caster")
@@ -258,7 +341,7 @@ class TestAreaAttackSavingThrowsWS(unittest.IsolatedAsyncioTestCase):
                 identity,
             )
 
-        self.assertEqual(len(mock_manager.events), 1)
+        self.assertEqual(len(mock_manager.events), 2)
         _, event_payload = mock_manager.events[0]
         self.assertTrue(event_payload["passed"])
         self.assertEqual(event_payload["damageAmount"], 10)  # 20 // 2 = 10
@@ -291,7 +374,7 @@ class TestAreaAttackSavingThrowsWS(unittest.IsolatedAsyncioTestCase):
                 gm_identity,
             )
 
-        self.assertEqual(len(mock_manager.events), 1)
+        self.assertEqual(len(mock_manager.events), 2)
         _, event_payload = mock_manager.events[0]
         self.assertTrue(event_payload["passed"])
         self.assertTrue(event_payload["isCritSuccess"])

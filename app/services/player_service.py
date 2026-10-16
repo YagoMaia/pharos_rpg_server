@@ -662,77 +662,100 @@ class PlayerService:
         """Dispara solicitação de salvaguarda para múltiplos alvos (ataques em área)."""
         data = RequestSavingThrowPayload(**payload)
         attacker = state.combatants.get(data.attackerId)
-        if not attacker:
-            return
+        attacker_name = (
+            attacker.name
+            if attacker
+            else (data.attackerName or data.attackerId or "Mestre")
+        )
 
-        if attacker.hp.current <= 0 or any(
-            c.name in {"Incapacitado", "Paralisado", "Atordoado"}
-            for c in attacker.conditions
-        ):
-            return
-
-        if data.costType != "none":
-            cost_attr = (
-                "standard"
-                if data.costType == "standard"
-                else "bonus"
-                if data.costType == "bonus"
-                else "reaction"
-            )
-            if not getattr(attacker.turnActions, cost_attr):
-                return
-            if data.focusCost > attacker.focus.current:
-                state.logs.append(f"{attacker.name} sem foco para {data.actionName}.")
+        if attacker:
+            if attacker.hp.current <= 0 or any(
+                c.name in {"Incapacitado", "Paralisado", "Atordoado"}
+                for c in attacker.conditions
+            ):
                 return
 
-        request_id = data.requestId or uuid.uuid4().hex
+            if data.costType != "none":
+                cost_attr = (
+                    "standard"
+                    if data.costType == "standard"
+                    else "bonus"
+                    if data.costType == "bonus"
+                    else "reaction"
+                )
+                if not getattr(attacker.turnActions, cost_attr, True):
+                    return
+                if data.focusCost > attacker.focus.current:
+                    state.logs.append(
+                        f"{attacker.name} sem foco para {data.actionName}."
+                    )
+                    return
+        else:
+            # Se não estiver no dicionário de combatentes, permite GM / narrador / perigo ambiental
+            if not (data.attackerId in ("gm", "GM_ADMIN") or data.attackerName):
+                return
+
+        request_id = data.requestId or data.attackId or uuid.uuid4().hex
         valid_targets = [t_id for t_id in data.targetIds if t_id in state.combatants]
         if not valid_targets:
             return
 
         log_msg = (
-            f"⚠️ {attacker.name} exigiu salvaguarda de {data.attribute} (CD {data.saveDC}) "
+            f"⚠️ {attacker_name} exigiu salvaguarda de {data.attribute} (CD {data.saveDC}) "
             f"para {data.actionName} contra {len(valid_targets)} alvo(s)!"
         )
         state.logs.append(log_msg)
 
         from app.managers.connection import manager
 
+        broadcast_payload = {
+            "requestId": request_id,
+            "attackId": request_id,
+            "attackerId": attacker.id if attacker else data.attackerId,
+            "attackerName": attacker_name,
+            "actionName": data.actionName,
+            "attribute": data.attribute,
+            "saveAttribute": data.attribute,
+            "saveDC": data.saveDC,
+            "baseDamage": data.baseDamage,
+            "halfOnSave": data.halfOnSave,
+            "targetIds": valid_targets,
+            "costType": data.costType,
+            "focusCost": data.focusCost,
+            "log": log_msg,
+        }
+
         await manager.broadcast_event(
             state.session_id,
             "REQUEST_SAVING_THROW",
-            {
-                "requestId": request_id,
-                "attackerId": attacker.id,
-                "attackerName": attacker.name,
-                "actionName": data.actionName,
-                "attribute": data.attribute,
-                "saveDC": data.saveDC,
-                "baseDamage": data.baseDamage,
-                "halfOnSave": data.halfOnSave,
-                "targetIds": valid_targets,
-                "costType": data.costType,
-                "focusCost": data.focusCost,
-                "log": log_msg,
-            },
+            broadcast_payload,
+        )
+        await manager.broadcast_event(
+            state.session_id,
+            "SAVING_THROW_REQUESTED",
+            broadcast_payload,
         )
 
     @staticmethod
     @static_method_log
     async def submit_saving_throw(state: CombatSession, payload: dict):
-        """Processa a rolagem de salvaguarda de um alvo e dispara SAVING_THROW_ROLLED."""
+        """Processa a rolagem de salvaguarda de um alvo e dispara SAVING_THROW_ROLLED / SAVING_THROW_SUBMITTED."""
         data = SubmitSavingThrowPayload(**payload)
-        target = state.combatants.get(data.combatantId)
+        target_id = data.combatantId or data.targetId
+        if not target_id:
+            return
+        target = state.combatants.get(target_id)
         if not target:
             return
 
+        roll_value = data.rollValue if data.rollValue is not None else (data.roll or 10)
         modifier = 0
-        is_crit_success = data.rollValue == 20
-        is_crit_fail = data.rollValue == 1
+        is_crit_success = roll_value == 20
+        is_crit_fail = roll_value == 1
 
         if data.attribute and data.saveDC is not None:
             res = resolve_saving_throw(
-                target, data.attribute, data.saveDC, data.rollValue
+                target, data.attribute, data.saveDC, roll_value
             )
             modifier = res["modifier"]
             total = res["total"]
@@ -740,12 +763,17 @@ class PlayerService:
             is_crit_success = res["is_crit_success"]
             is_crit_fail = res["is_crit_fail"]
         else:
-            modifier = (
-                get_target_save_modifier(target, data.attribute)
-                if data.attribute
-                else 0
-            )
-            total = data.rollValue + modifier
+            if data.total is not None:
+                total = data.total
+                modifier = total - roll_value
+            else:
+                modifier = (
+                    get_target_save_modifier(target, data.attribute)
+                    if data.attribute
+                    else 0
+                )
+                total = roll_value + modifier
+
             passed = (
                 data.passed
                 if data.passed is not None
@@ -768,28 +796,39 @@ class PlayerService:
         attr_label = data.attribute or "Salvaguarda"
         log_msg = (
             f"🎲 {target.name} rolou salvaguarda de {attr_label}: "
-            f"{data.rollValue} + {modifier} = {total} ({res_str})"
+            f"{roll_value} + {modifier} = {total} ({res_str})"
             f"{f' sofrerá {damage_amount} de dano' if damage_amount > 0 else ''}."
         )
         state.logs.append(log_msg)
 
         from app.managers.connection import manager
 
+        broadcast_payload = {
+            "requestId": data.requestId or data.attackId,
+            "attackId": data.requestId or data.attackId,
+            "combatantId": target.id,
+            "targetId": target.id,
+            "combatantName": target.name,
+            "targetName": target.name,
+            "rollValue": roll_value,
+            "roll": roll_value,
+            "modifier": modifier,
+            "total": total,
+            "passed": passed,
+            "isCritSuccess": is_crit_success,
+            "isCritFail": is_crit_fail,
+            "damageAmount": damage_amount,
+            "currentHp": target.hp.current,
+            "log": log_msg,
+        }
+
         await manager.broadcast_event(
             state.session_id,
             "SAVING_THROW_ROLLED",
-            {
-                "requestId": data.requestId,
-                "combatantId": target.id,
-                "combatantName": target.name,
-                "rollValue": data.rollValue,
-                "modifier": modifier,
-                "total": total,
-                "passed": passed,
-                "isCritSuccess": is_crit_success,
-                "isCritFail": is_crit_fail,
-                "damageAmount": damage_amount,
-                "currentHp": target.hp.current,
-                "log": log_msg,
-            },
+            broadcast_payload,
+        )
+        await manager.broadcast_event(
+            state.session_id,
+            "SAVING_THROW_SUBMITTED",
+            broadcast_payload,
         )

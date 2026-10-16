@@ -93,10 +93,14 @@ class GameLogic:
     def _authorize_player_command(
         self, state: CombatSession, event_type: str, payload: dict, identity: dict
     ):
-        if identity.get("role") == "gm":
+        client_id = identity.get("client_id")
+        if (
+            identity.get("role") == "gm"
+            or (state.gmClientId and client_id == state.gmClientId)
+        ):
+            identity["role"] = "gm"
             return
 
-        client_id = identity.get("client_id")
         if not client_id:
             raise AuthorizationError("Comando requer clientId.")
 
@@ -112,7 +116,11 @@ class GameLogic:
                 self._authorize_sheet(state, active_id, identity)
             return
 
-        actor_id = payload.get("attackerId") or payload.get("combatantId")
+        actor_id = (
+            payload.get("attackerId")
+            or payload.get("combatantId")
+            or payload.get("targetId")
+        )
         if not actor_id or not self._owned_by_client(state, actor_id, client_id):
             raise AuthorizationError("Você só pode comandar seu personagem ou pet.")
         if identity.get("authenticated"):
@@ -253,9 +261,9 @@ class GameLogic:
                     await PlayerService.apply_condition(state, payload)
                 case "REMOVE_CONDITION":
                     await PlayerService.remove_condition(state, payload)
-                case "REQUEST_SAVING_THROW":
+                case "REQUEST_SAVING_THROW" | "SAVING_THROW_REQUESTED":
                     await PlayerService.request_saving_throw(state, payload)
-                case "SUBMIT_SAVING_THROW":
+                case "SUBMIT_SAVING_THROW" | "SAVING_THROW_SUBMITTED":
                     await PlayerService.submit_saving_throw(state, payload)
 
             # 5. Persistência e Broadcast (Ainda dentro do Lock)
