@@ -33,7 +33,12 @@ uv sync
 # Instalação
 uv sync
 
-# Testes
+# Testes — exige Redis de integração; ver observação abaixo
+uv run pytest
+
+# Testes com Redis em container
+docker run -d --name pharos-test-redis -p 6379:6379 redis:7-alpine
+$env:PHAROS_TEST_REDIS_URL = "redis://127.0.0.1:6379/0"
 uv run pytest
 
 # Lint
@@ -48,6 +53,12 @@ não identificado
 
 ### Observações para agents
 
+- `tests/test_campaign_live_redis.py` **falha** sem Redis de integração, por
+  escolha: ele cobre pub/sub real e um `skipTest()` silencioso deixava a suíte
+  verde sem exercitar o transporte. Precedência: `PHAROS_TEST_REDIS_URL` →
+  `redis-server` efêmero no PATH → falha com mensagem explícita.
+- `ruff` não está declarado em `pyproject.toml`; rodar com
+  `uv run --with ruff ruff check .` até que entre no grupo `dev`.
 - Não assumir Python global; usar `uv` e a versão definida pelo projeto.
 - Não acessar `.env*`, secrets ou diretórios de dependências (`.venv`, `dist`, `build`).
 - Não alterar/remover `uv.lock` sem confirmação humana.
