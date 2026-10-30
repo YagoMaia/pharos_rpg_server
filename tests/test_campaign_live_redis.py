@@ -1,5 +1,16 @@
-"""Integração local: API e WebSockets ASGI usando Redis descartável."""
+"""Integração: API e WebSockets ASGI contra um Redis real.
 
+Redis de integração, por precedência:
+  1. `PHAROS_TEST_REDIS_URL` — qualquer Redis acessível, inclusive container
+     (ex.: `redis://127.0.0.1:6379/0`).
+  2. `redis-server` efêmero iniciado por este módulo.
+
+Sem nenhum dos dois o teste **falha** em vez de pular. Ele existe para
+exercitar pub/sub real; `skipTest()` deixava a suíte verde sem nunca cobrir o
+transporte, que é justamente o que mais quebra em produção.
+"""
+
+import os
 import shutil
 import socket
 import subprocess
@@ -10,6 +21,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from redis import Redis
+from redis.exceptions import RedisError
 from starlette.websockets import WebSocketDisconnect
 
 from app.main import app
@@ -18,6 +31,24 @@ from app.routers import websocket as ws_router
 from app.routers.campaigns import get_campaign_store
 from app.services.campaign_store import CampaignStore
 from app.services.engine import GameLogic
+
+REDIS_URL_ENV = "PHAROS_TEST_REDIS_URL"
+MISSING_REDIS_HINT = (
+    "Redis de integração indisponível. Defina "
+    f"{REDIS_URL_ENV}=redis://127.0.0.1:6379/0 ou instale redis-server no PATH. "
+    "Este teste cobre pub/sub real e não pode ser pulado em silêncio."
+)
+
+
+def responds_to_ping(url: str) -> bool:
+    try:
+        client = Redis.from_url(url, socket_connect_timeout=1)
+        try:
+            return bool(client.ping())
+        finally:
+            client.close()
+    except (RedisError, OSError):
+        return False
 
 
 def available_port() -> int:
@@ -28,37 +59,23 @@ def available_port() -> int:
 
 class CampaignLiveRedisTests(unittest.TestCase):
     def setUp(self):
-        executable = shutil.which("redis-server")
-        if not executable:
-            self.skipTest("redis-server não está disponível no PATH")
         self.directory = TemporaryDirectory()
-        port = available_port()
-        self.server = subprocess.Popen(
-            [
-                executable,
-                "--bind",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--save",
-                "",
-                "--appendonly",
-                "no",
-            ],
-            cwd=self.directory.name,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            self.wait_for_redis(port)
-        except Exception:
-            self.stop_redis()
-            self.directory.cleanup()
-            raise
+        self.server = None
+        self.redis_url = os.environ.get(REDIS_URL_ENV, "").strip()
+
+        if self.redis_url:
+            if not responds_to_ping(self.redis_url):
+                self.fail(f"{REDIS_URL_ENV}={self.redis_url} não responde a PING.")
+        else:
+            self.redis_url = self._start_ephemeral_redis()
+
+        if not self.redis_url:
+            self.fail(MISSING_REDIS_HINT)
+
         self.store = CampaignStore(Path(self.directory.name) / "campaign.sqlite3")
         self.manager = ConnectionManager()
         self.manager.redis = self.manager.redis.from_url(
-            f"redis://127.0.0.1:{port}/0", decode_responses=True
+            self.redis_url, decode_responses=True
         )
         self.patches = [
             patch.object(ws_router, "manager", self.manager),
@@ -80,25 +97,54 @@ class CampaignLiveRedisTests(unittest.TestCase):
         self.stop_redis()
         self.directory.cleanup()
 
+    def _start_ephemeral_redis(self) -> str | None:
+        """Sobe um Redis descartável local; retorna None se não for possível."""
+        executable = shutil.which("redis-server")
+        if not executable:
+            return None
+        port = available_port()
+        self.server = subprocess.Popen(
+            [
+                executable,
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+            ],
+            cwd=self.directory.name,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if not self._wait_for_redis(port):
+            self.stop_redis()
+            return None
+        return f"redis://127.0.0.1:{port}/0"
+
+    def _wait_for_redis(self, port: int) -> bool:
+        until = time.monotonic() + 5
+        while time.monotonic() < until:
+            if self.server.poll() is not None:
+                return False
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    return True
+            except OSError:
+                time.sleep(0.05)
+        return False
+
     def stop_redis(self):
+        if self.server is None:
+            return
         self.server.terminate()
         try:
             self.server.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.server.kill()
             self.server.wait(timeout=5)
-
-    def wait_for_redis(self, port: int):
-        until = time.monotonic() + 5
-        while time.monotonic() < until:
-            if self.server.poll() is not None:
-                break
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                    return
-            except OSError:
-                time.sleep(0.05)
-        self.fail("Redis temporário não iniciou")
 
     def post(
         self, path: str, body: dict | None = None, token: str | None = None
