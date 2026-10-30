@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from app.services.campaign_store import CampaignError
+from app.services.errors import CampaignError
 
 SESSIONS = "campaign_sessions"
 NPCS = "campaign_npcs"
