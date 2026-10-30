@@ -7,7 +7,6 @@ from fastapi import WebSocketDisconnect
 
 from app.managers.connection import ConnectionManager
 from app.models.domain import Combatant, CombatSession
-from app.routers import websocket as websocket_router
 from app.services.engine import GameLogic
 from app.services.gm_service import GMService
 from app.services.player_service import PlayerService
@@ -162,37 +161,53 @@ class CombatRegressions(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(restored.hp.current, 12)
             self.assertEqual(restored.hp.max, 27)
 
-    async def test_two_websocket_connections_do_not_lose_concurrent_updates(self):
-        manager = MemoryManager(session(actor("a"), actor("b")))
+    async def test_two_campaign_sockets_do_not_lose_concurrent_updates(self):
+        """Dois sockets atualizando a mesma sala em paralelo não podem perder escrita.
+
+        Reescrito para a sala autenticada: a versão anterior chamava
+        `websocket_endpoint(a, "ROOM")` com `clientId` dentro do payload, ou
+        seja, dependia exatamente do ramo legado não autenticado e da
+        normalização de caixa que foram removidos. A garantia testada
+        (serialização por sala) é a mesma; apenas o caminho deixou de ser o
+        legado.
+        """
+        # A sala começa com dois jogadores já presentes: o caminho autenticado
+        # recusa que um JOIN tome o ID de um combatente que não é jogador.
+        manager = MemoryManager(
+            session(
+                actor("a", type="player", sheetId="sheet-a"),
+                actor("b", type="player", sheetId="sheet-b"),
+            )
+        )
+        room = "campaign-6f1c0b0e-1a2b-4c3d-9e8f-7a6b5c4d3e2f"
 
         def socket(identifier, hp):
-            combatant = actor(identifier, type="player").model_dump()
-            return Mock(
-                receive_text=AsyncMock(side_effect=[
-                    json.dumps({"type": "JOIN_SESSION", "payload": {
-                        "clientId": f"client-{identifier}", "combatant": combatant,
-                    }}),
-                    json.dumps({"type": "MANUAL_UPDATE", "payload": {
-                        "clientId": f"client-{identifier}", "combatantId": identifier, "newHp": hp,
-                    }}),
-                    WebSocketDisconnect(),
-                ]),
-                send_json=AsyncMock(),
-            )
+            combatant = actor(identifier, type="player", sheetId=f"sheet-{identifier}").model_dump()
+            identity = {
+                "authenticated": True,
+                "role": "player",
+                "client_id": f"user:{identifier}",
+                "character_id": f"sheet-{identifier}",
+                "player_id": None,
+            }
+            return identity, [
+                {"type": "JOIN_SESSION", "payload": {"combatant": combatant}},
+                {"type": "MANUAL_UPDATE", "payload": {"combatantId": identifier, "newHp": hp}},
+            ]
 
-        a, b = socket("a", 11), socket("b", 7)
-        with patch.object(websocket_router, "manager", manager), \
-             patch.object(websocket_router.game_logic, "manager", manager), \
-             patch("app.managers.connection.manager", manager):
-            await asyncio.gather(
-                websocket_router.websocket_endpoint(a, "ROOM"),
-                websocket_router.websocket_endpoint(b, "room"),
-            )
-        state = await manager.get_state("room")
+        identity_a, messages_a = socket("a", 11)
+        identity_b, messages_b = socket("b", 7)
+        engine = GameLogic(manager)
+
+        async def drive(identity, messages):
+            for message in messages:
+                await engine.handle_message(room, message, identity)
+
+        with patch("app.managers.connection.manager", manager):
+            await asyncio.gather(drive(identity_a, messages_a), drive(identity_b, messages_b))
+
+        state = await manager.get_state(room)
         self.assertEqual({key: c.hp.current for key, c in state.combatants.items()}, {"a": 11, "b": 7})
-        self.assertEqual(manager.disconnect.call_count, 2)
-        a.send_json.assert_not_called()
-        b.send_json.assert_not_called()
 
     async def test_phase_survives_persistence_and_broadcast_and_duplicate_command(self):
         boss = actor("boss", hp={"current": 0, "max": 20}, armorClass=20,
