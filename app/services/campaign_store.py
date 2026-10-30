@@ -10,6 +10,8 @@ import sqlite3
 import time
 from uuid import uuid4
 
+from app.core.database import open_connection
+
 
 class CampaignError(Exception):
     def __init__(self, status: int, message: str):
@@ -153,10 +155,7 @@ class CampaignStore:
                 conn.execute("ALTER TABLE members ADD COLUMN character_data TEXT")
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        return open_connection(self.path)
 
     def _issue_token(self, conn: sqlite3.Connection, user_id: str) -> str:
         token = secrets.token_urlsafe(32)
