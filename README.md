@@ -67,3 +67,47 @@ docker exec pharos-backend rm /data/backup.sqlite3
 
 O runbook versionado fica em `docs/DEPLOYMENT_DOCKER.md` e `docs/CHECKLIST_DEPLOY.md`
 no repositório do frontend (`pharos_rp`).
+
+## Preparação do mestre (fontes, rascunhos, credenciais)
+
+Fluxo em três camadas, cada uma com sua rota sob `/campaigns/{campaign_id}/preparation`:
+
+| Camada | Rotas | O que faz |
+|---|---|---|
+| fontes brutas | `POST /sources/import`, `GET /sources`, `GET /sources/{id}/revisions/{n}` | guarda o texto recebido byte a byte, com revisões imutáveis |
+| rascunhos | `POST/GET /drafts`, `GET/PUT /drafts/{id}` | propostas tipadas (sessão/encontro/NPC/missão) vinculadas a `(sourceId, revision)` |
+| aplicação | `POST /drafts/{id}/apply` | rascunho revisado vira registro oficial, numa transação só |
+
+Nenhuma dessas rotas inicia combate nem escreve em `journal_entries`. Aplicar um
+rascunho cujo conteúdo chega aos jogadores (resumo de sessão, NPC/missão com
+`visibility=party`) exige `acknowledgePlayerVisibility: true` no pedido.
+
+### Credencial de preparação (para o agent do mestre)
+
+O agent de preparação autentica com uma credencial emitida pelo próprio GM, em vez
+da senha ou do token de sessão do app:
+
+```bash
+# o GM (logado no app) emite uma credencial por campanha:
+curl -X POST "$PHAROS/campaigns/$CID/preparation/tokens" \
+  -H "Authorization: Bearer $SESSION_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"label": "agent do Victor"}'
+# -> { "id": "...", "token": "pharos_prep_..." }   (o valor aparece só aqui)
+
+# o agent usa a credencial:
+curl "$PHAROS/campaigns/$CID/preparation/sources" -H "Authorization: Bearer pharos_prep_..."
+```
+
+Regras (cobertas por testes em `tests/test_preparation_tokens.py`):
+
+- no banco fica apenas o SHA-256 da credencial; `GET /preparation/tokens` lista
+  rótulo, criação e último uso — nunca o segredo;
+- `DELETE /preparation/tokens/{id}` revoga e vale imediatamente;
+- a credencial autentica **somente** rotas de preparação da campanha dela, e só
+  as de criação/edição de fontes e rascunhos;
+- a credencial **não aplica rascunho**: publicar exige o GM logado no app, porque
+  "`approved` enviado pelo modelo não comprova consentimento humano".
+
+A tela do painel do mestre para emitir/revogar essas credenciais ainda não existe;
+por enquanto a emissão é pela rota acima.
