@@ -82,6 +82,14 @@ Nenhuma dessas rotas inicia combate nem escreve em `journal_entries`. Aplicar um
 rascunho cujo conteúdo chega aos jogadores (resumo de sessão, NPC/missão com
 `visibility=party`) exige `acknowledgePlayerVisibility: true` no pedido.
 
+Importar é idempotente por `idempotencyKey`, e a chave representa **um** pedido
+(coleção + caminho + conteúdo): repetir o mesmo pedido devolve exatamente o
+resultado anterior; reutilizar a chave para outra fonte devolve 409. Para
+acrescentar revisão com segurança, envie `expectedRevision` com o número que você
+leu — se a fonte mudou no meio do caminho, a resposta é 409, não sobrescrita. A
+leitura da chave, a leitura da fonte e a escrita acontecem numa transação só, então
+duas importações concorrentes do mesmo arquivo não viram fonte duplicada nem 500.
+
 ### Credencial de preparação (para o agent do mestre)
 
 O agent de preparação autentica com uma credencial emitida pelo próprio GM, em vez
