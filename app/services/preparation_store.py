@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.core.database import open_connection
 from app.services.campaign_store import CampaignError, CampaignStore
 
 MAX_CONTENT_CHARS = 200_000
@@ -134,10 +135,7 @@ class PreparationStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        return open_connection(self.path)
 
     # ── escrita ────────────────────────────────────────────────────────────
 

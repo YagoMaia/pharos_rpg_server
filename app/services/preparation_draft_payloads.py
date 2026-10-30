@@ -26,6 +26,9 @@ MAX_SOURCE_REFS = 20
 MAX_UNCERTAINTY_ITEMS = 20
 MAX_UNCERTAINTY_CHARS = 500
 MAX_MONSTER_ENTRIES = 50
+# SQLite só vincula inteiro assinado de 64 bits: acima disso o binding estoura e o
+# pedido viraria 500. O limite pertence à fronteira, não ao banco.
+MAX_SQLITE_INTEGER = 2**63 - 1
 
 
 class SessionPayload(BaseModel):
@@ -97,7 +100,7 @@ class SourceRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sourceId: str = Field(min_length=1, max_length=64)
-    revision: int = Field(ge=1)
+    revision: int = Field(ge=1, le=MAX_SQLITE_INTEGER)
 
 
 def parse_payload(raw: Any) -> BaseModel:
@@ -105,7 +108,9 @@ def parse_payload(raw: Any) -> BaseModel:
     if not isinstance(raw, dict):
         raise CampaignError(422, "payload deve ser um objeto JSON com 'kind'.")
     kind = raw.get("kind")
-    model = PAYLOAD_BY_KIND.get(kind)
+    # lookup de dicionário com valor não hashable (lista/objeto) estouraria antes
+    # da validação: tudo que não for string cai no 422 com o tipo recebido
+    model = PAYLOAD_BY_KIND.get(kind) if isinstance(kind, str) else None
     if model is None:
         raise CampaignError(
             422,

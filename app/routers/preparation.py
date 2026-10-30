@@ -5,19 +5,23 @@ onde a autorização e as regras de conteúdo vivem. Manter a autorização nas 
 é o que impede que um futuro adaptador MCP, com outro transporte, esqueça de
 checar papel e campanha.
 
-Etapas 2 e 4 do plano `plans/mcp-preparacao-campanha.md` (ai-memory: workspace
-`pharos`, projeto `intregração`). Não há rota de aplicação de rascunho aqui: isso
-é a etapa 5, e exige aprovação humana no app, não a credencial do agent.
+Etapas 2, 4 e 5 do plano `plans/mcp-preparacao-campanha.md` (ai-memory: workspace
+`pharos`, projeto `intregração`). A rota de aplicação existe, mas quem a chama é a
+aprovação humana no app: o agent do mestre importa e propõe, o mestre decide o que
+vira registro oficial.
 """
 
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import settings
 from app.routers.campaigns import Store, User, get_campaign_store
+from app.services.preparation_applications import MAX_IDEMPOTENCY_KEY_CHARS
+from app.services.preparation_apply import PreparationApplyStore, build_apply_store
+from app.services.preparation_draft_payloads import MAX_SQLITE_INTEGER
 from app.services.preparation_drafts import PreparationDraftStore, build_draft_store
 from app.services.preparation_store import PreparationStore
 
@@ -42,7 +46,7 @@ class ImportSourceBody(BaseModel):
     title: str
     content: str
     idempotencyKey: str | None = None
-    expectedRevision: int | None = Field(default=None, ge=1)
+    expectedRevision: int | None = Field(default=None, ge=1, le=MAX_SQLITE_INTEGER)
 
 
 @router.post("/campaigns/{campaign_id}/preparation/sources/import", status_code=201)
@@ -80,7 +84,7 @@ def list_sources(
 def read_source_revision(
     campaign_id: str,
     source_id: str,
-    revision: int,
+    revision: Annotated[int, Path(ge=1, le=MAX_SQLITE_INTEGER)],
     user: User,
     preparation: Preparation,
 ):
@@ -102,10 +106,26 @@ class DraftBody(BaseModel):
 
 
 class DraftUpdateBody(DraftBody):
-    """Edição exige a revisão lida; `applied` só existe a partir da etapa 5."""
+    """Edição exige a revisão lida; rascunho já aplicado não é editável."""
 
-    expectedRevision: int = Field(ge=1)
+    expectedRevision: int = Field(ge=1, le=MAX_SQLITE_INTEGER)
     status: Literal["draft", "approved", "rejected"] | None = None
+
+
+class ApplyBody(BaseModel):
+    """Pedido de aplicação: o mestre afirma que leu os avisos de visibilidade.
+
+    `acknowledgePlayerVisibility` existe porque o servidor conhece o risco (resumo
+    de sessão e `visibility=party` chegam aos jogadores) mas não pode decidir pelo
+    mestre o que pode ser publicado.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotencyKey: str | None = Field(
+        default=None, min_length=1, max_length=MAX_IDEMPOTENCY_KEY_CHARS
+    )
+    acknowledgePlayerVisibility: bool = False
 
 
 def get_draft_store(campaigns: Store, preparation: Preparation) -> PreparationDraftStore:
@@ -162,4 +182,27 @@ def update_draft(
         source_refs=body.sourceRefs,
         uncertainties=body.uncertainties,
         status=body.status,
+    )
+
+
+# ── aplicação (etapa 5): rascunho revisado vira registro oficial ─────────────
+
+
+def get_apply_store(campaigns: Store, preparation: Preparation) -> PreparationApplyStore:
+    """Derivado das mesmas stores: banco e autorização compartilhados."""
+    return build_apply_store(preparation.path, campaigns, preparation)
+
+
+Applies = Annotated[PreparationApplyStore, Depends(get_apply_store)]
+
+
+@router.post("/campaigns/{campaign_id}/preparation/drafts/{draft_id}/apply", status_code=201)
+def apply_draft(campaign_id: str, draft_id: str, body: ApplyBody, user: User, apply: Applies):
+    """Escreve o destino oficial e registra a aplicação numa transação só."""
+    return apply.apply(
+        user["id"],
+        campaign_id,
+        draft_id,
+        idempotency_key=body.idempotencyKey,
+        acknowledge_player_visibility=body.acknowledgePlayerVisibility,
     )

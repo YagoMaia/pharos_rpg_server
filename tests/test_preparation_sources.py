@@ -241,17 +241,14 @@ class PreparationSourceTests(unittest.TestCase):
         teste pega. O contrato do plano é que preparação nunca emite evento de
         combate nem altera estado vivo.
         """
-        from unittest.mock import patch
+        from combat_guard import no_combat_transport
 
-        with patch("app.managers.connection.manager") as transport:
+        with no_combat_transport():
             imported = self.import_source("nada de combate")
             self.client.get(
                 f"/campaigns/{self.campaign_id}/preparation/sources", headers=self.gm
             )
         self.assertEqual(imported.status_code, 201)
-        transport.get_state.assert_not_called()
-        transport.broadcast_state.assert_not_called()
-        transport.broadcast_event.assert_not_called()
 
     def test_sources_persist_across_store_instances(self):
         imported = self.import_source("conteúdo persistente").json()

@@ -21,6 +21,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier, Thread
 from typing import ClassVar
 
 from fastapi.testclient import TestClient
@@ -28,8 +29,8 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.routers.campaigns import get_campaign_store
 from app.routers.preparation import get_preparation_store
-from app.services.campaign_store import CampaignStore
-from app.services.preparation_drafts import build_draft_store
+from app.services.campaign_store import CampaignError, CampaignStore
+from app.services.preparation_drafts import PreparationDraftStore, build_draft_store
 from app.services.preparation_store import PreparationStore
 
 COLLECTION = "campanha-victor"
@@ -327,14 +328,141 @@ class PreparationDraftTests(unittest.TestCase):
         self.assertEqual(redirected["possibleTargets"], [])
 
     def test_drafts_do_not_reach_the_combat_transport(self):
-        from unittest.mock import patch
+        from combat_guard import no_combat_transport
 
-        with patch("app.managers.connection.manager") as transport:
+        with no_combat_transport():
             self.create_draft(self.SESSION_PAYLOAD).raise_for_status()
             self.client.get(self.draft_path(), headers=self.gm)
-        transport.get_state.assert_not_called()
-        transport.broadcast_state.assert_not_called()
-        transport.broadcast_event.assert_not_called()
+
+
+    # ── concorrência, aprovação e contrato (revisão da etapa 4) ────────────
+
+    def edit_through_the_store(self, draft_id: str, role: str) -> str:
+        """Edita direto no store para poder disparar duas edições ao mesmo tempo."""
+        drafts = PreparationDraftStore(self.database, self.store, self.preparation)
+        user_id = self.store.user_for_token(self.gm["Authorization"][7:])["id"]
+        try:
+            drafts.update_draft(
+                user_id,
+                self.campaign_id,
+                draft_id,
+                payload={**self.NPC_PAYLOAD, "role": role},
+                expected_revision=1,
+            )
+            return "ok"
+        except CampaignError as error:
+            return str(error.status)
+
+    def test_concurrent_edits_do_not_both_win(self):
+        """Duas edições com a mesma revisão lida: uma escreve, a outra ouve 409.
+
+        Sem o `revision = ?` no `WHERE` do UPDATE, a segunda sobrescreve a primeira
+        em silêncio — foi o que a revisão de código reproduziu com duas threads.
+        """
+        draft = self.create_draft(self.NPC_PAYLOAD).json()
+        started = Barrier(2)
+        outcomes: list[str] = []
+
+        def edit(role: str) -> None:
+            started.wait()
+            outcomes.append(self.edit_through_the_store(draft["id"], role))
+
+        threads = [Thread(target=edit, args=(role,)) for role in ("edição A", "edição B")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(sorted(outcomes), ["409", "ok"])
+        current = self.client.get(self.draft_path(draft["id"]), headers=self.gm).json()
+        self.assertEqual(current["revision"], 2)
+
+    def test_editing_the_content_invalidates_a_previous_approval(self):
+        """Aprovação vale para uma versão: mudar payload/links volta para `draft`."""
+        created = self.create_draft(self.NPC_PAYLOAD).json()
+        approved = self.client.put(
+            self.draft_path(created["id"]),
+            headers=self.gm,
+            json={"payload": self.NPC_PAYLOAD, "status": "approved", "expectedRevision": 1},
+        ).json()
+        self.assertEqual(approved["status"], "approved")
+
+        edited = self.client.put(
+            self.draft_path(created["id"]),
+            headers=self.gm,
+            json={
+                "payload": {**self.NPC_PAYLOAD, "role": "informante da irmandade"},
+                "expectedRevision": 2,
+            },
+        ).json()
+        self.assertEqual(edited["status"], "draft")
+        self.assertEqual(edited["payload"]["role"], "informante da irmandade")
+
+    def test_repeated_source_reference_is_stored_once(self):
+        """Citar duas vezes a mesma revisão é o mesmo vínculo, não um 500."""
+        source = self.import_source("notas citadas em dobro")
+        created = self.create_draft(
+            self.NPC_PAYLOAD,
+            sourceRefs=[
+                {"sourceId": source["id"], "revision": 1},
+                {"sourceId": source["id"], "revision": 1},
+            ],
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertEqual(
+            created.json()["sourceRefs"], [{"sourceId": source["id"], "revision": 1}]
+        )
+
+    def test_put_replaces_the_source_links(self):
+        """PUT substitui também `sourceRefs`: omitê-los desfaz o vínculo."""
+        source = self.import_source("vínculo substituível")
+        draft = self.create_draft(
+            self.NPC_PAYLOAD, sourceRefs=[{"sourceId": source["id"], "revision": 1}]
+        ).json()
+        self.assertEqual(len(draft["sourceRefs"]), 1)
+
+        edited = self.client.put(
+            self.draft_path(draft["id"]),
+            headers=self.gm,
+            json={"payload": self.NPC_PAYLOAD, "expectedRevision": 1},
+        ).json()
+        self.assertEqual(edited["sourceRefs"], [])
+
+    def test_target_must_belong_to_the_same_campaign(self):
+        """`targetId` de outra campanha é recusado: rascunho não edita a mesa vizinha."""
+        other = self.client.post(
+            "/campaigns", headers=self.gm, json={"name": "Outra campanha"}
+        ).json()["id"]
+        stranger = self.client.post(
+            f"/campaigns/{other}/npcs",
+            headers=self.gm,
+            json={"name": "Ferrarin de outra mesa"},
+        ).json()
+
+        refused = self.create_draft(self.NPC_PAYLOAD, targetId=stranger["id"])
+        self.assertEqual(refused.status_code, 422, refused.text)
+        self.assertIn("targetId", refused.text)
+
+    def test_kind_that_is_not_a_string_is_a_422_not_a_crash(self):
+        """`kind` lista/objeto quebrava o lookup antes da validação (500)."""
+        for kind in ([], {}, 42, None):
+            with self.subTest(kind=kind):
+                response = self.create_draft({"kind": kind, "name": "sem tipo"})
+                self.assertEqual(response.status_code, 422, response.text)
+
+    def test_revision_larger_than_a_sqlite_integer_is_refused(self):
+        """Acima de 64 bits o binding estoura: a fronteira recusa, o banco não vê."""
+        huge = 2**63
+        refused = self.create_draft(
+            self.NPC_PAYLOAD, sourceRefs=[{"sourceId": "fonte", "revision": huge}]
+        )
+        self.assertEqual(refused.status_code, 422, refused.text)
+
+        read = self.client.get(
+            f"/campaigns/{self.campaign_id}/preparation/sources/x/revisions/{huge}",
+            headers=self.gm,
+        )
+        self.assertEqual(read.status_code, 422, read.text)
 
 
 if __name__ == "__main__":
