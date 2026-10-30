@@ -119,3 +119,69 @@ Regras (cobertas por testes em `tests/test_preparation_tokens.py`):
 
 A tela do painel do mestre para emitir/revogar essas credenciais ainda não existe;
 por enquanto a emissão é pela rota acima.
+
+## MCP de preparação (`/mcp`)
+
+O agent do mestre fala com o servidor pelo endpoint MCP publicado no mesmo processo
+e domínio da API — nada é instalado na máquina de quem usa:
+
+```
+https://pharos-server.yagomaia.com.br/mcp     # Streamable HTTP, stateless, JSON
+Authorization: Bearer pharos_prep_...          # a credencial de preparação da campanha
+```
+
+A campanha vem **da credencial**. Nenhuma ferramenta aceita `campaignId`: o modelo
+não escolhe a mesa. Sem credencial (ou com credencial revogada) o transporte
+responde 401 antes de qualquer método do protocolo, e Host/Origin fora da lista
+responde 421 — a proteção contra DNS rebinding do SDK fica ligada.
+
+| Ferramenta | O que faz |
+|---|---|
+| `connection_status` | campanha da credencial, permissões e limites (nunca mostra a credencial) |
+| `import_source` | recebe o texto bruto lido localmente; idempotente, cria revisão só se mudou |
+| `list_sources` / `search_sources` | metadados e busca textual nas fontes da campanha |
+| `read_source` | janela da revisão (padrão 8 000, máx. 20 000 caracteres) com `truncated`/`nextOffset` |
+| `read_campaign_context` | sessões/encontros/NPCs/missões já existentes (id, nome, estado) |
+| `save_preparation_draft` | cria ou revisa proposta tipada ligada a `(sourceId, revision)` |
+| `read_preparation_draft` | rascunho, vínculos, alvos possíveis e avisos de visibilidade |
+
+Não existe ferramenta de aplicar, publicar, excluir, iniciar combate ou ler
+filesystem remoto — e a store também recusa essas capacidades para a credencial,
+então a ausência de ferramenta não é a única barreira. Conteúdo por fonte: até
+200 000 caracteres; `sourceRefs` por rascunho: até 12.
+
+Configuração (variáveis de ambiente, lista separada por vírgula):
+
+| Variável | Padrão | Observação |
+|---|---|---|
+| `MCP_PATH` | `/mcp` | as duas formas (`/mcp` e `/mcp/`) atendem sem redirect |
+| `MCP_ALLOWED_HOSTS` | `pharos-server.yagomaia.com.br` | `Host` liberado no túnel; **vazio desliga o endpoint** |
+| `MCP_ALLOWED_ORIGINS` | vazio | necessário só se o cliente enviar `Origin` |
+
+No agent (OpenCode e afins), o servidor remoto entra com o header apontando para a
+variável que guarda a credencial — nunca a credencial escrita no arquivo:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "pharos": {
+      "type": "remote",
+      "url": "https://pharos-server.yagomaia.com.br/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": { "Authorization": "Bearer {env:PHAROS_PREP_TOKEN}" }
+    }
+  }
+}
+```
+
+O `oauth: false` importa: sem ele o harness lê o 401 como convite para iniciar
+fluxo OAuth, e aqui a credencial é um Bearer emitido pelo mestre. As ferramentas
+aparecem com o prefixo do servidor (`pharos_import_source`, `pharos_read_source`,
+…), o que permite liberar ou bloquear por padrão na opção `tools`. Detalhe prático:
+vários harnesses usam timeout de ~30 s por chamada MCP; para nota grande, aumentar
+`timeout` na configuração do servidor.
+
+Testes do transporte, da credencial e das ferramentas: `tests/test_preparation_mcp.py`
+(cliente MCP oficial sobre o ASGI real, não chamada direta de função).
