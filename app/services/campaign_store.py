@@ -321,6 +321,18 @@ class CampaignStore:
             ).fetchall()
             return [self._summary(row) for row in rows]
 
+    def assert_gm(self, user_id: str, campaign_id: str) -> dict:
+        """Confirma que o usuário é o mestre da campanha; 403/404 como `_member`.
+
+        Reutilizado pelas rotas de preparação para que a autorização não dependa
+        de cada chamador lembrar de checar o papel.
+        """
+        with closing(self._connect()) as conn:
+            member = self._member(conn, campaign_id, user_id)
+            if member["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode acessar a preparação.")
+            return dict(member)
+
     def get_campaign(self, user_id: str, campaign_id: str) -> dict:
         with closing(self._connect()) as conn:
             campaign = self._summary(self._member(conn, campaign_id, user_id))
