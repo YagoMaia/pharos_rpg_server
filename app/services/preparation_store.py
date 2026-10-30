@@ -311,6 +311,21 @@ class PreparationStore:
                 "importedAt": row["imported_at"],
             }
 
+    def has_revision(self, campaign_id: str, source_id: str, revision: int) -> bool:
+        """A revisão existe nessa campanha? Chamado após `assert_gm` do chamador.
+
+        Existe para o `PreparationDraftStore` validar `(sourceId, revision)` sem
+        copiar SQL das fontes. Não autoriza: quem chama já autorizou.
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT 1 FROM preparation_source_revisions r
+                JOIN preparation_sources s ON s.id = r.source_id
+                WHERE r.source_id = ? AND r.revision = ? AND s.campaign_id = ?""",
+                (source_id, int(revision), campaign_id),
+            ).fetchone()
+            return row is not None
+
     # ── auxiliares ─────────────────────────────────────────────────────────
 
     def _revision(self, conn: sqlite3.Connection, source_id: str, revision: int) -> dict:
