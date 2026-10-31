@@ -6,24 +6,39 @@ workspace pharos / projeto intregração). Regras centrais verificadas aqui:
 - o servidor preserva o texto exatamente como recebeu (sem trim/reformatação);
 - o checksum é do conteúdo recebido, não uma prova sobre o arquivo local;
 - reimportar conteúdo idêntico não cria revisão; retry não duplica;
-- caminho relativo é metadado: nunca vira leitura de filesystem;
+- a importação é uma seção crítica: chave idempotente, fonte e próxima revisão são
+  lidos e escritos na MESMA transação, então duas chamadas juntas não geram fonte
+  duplicada nem 500 de `IntegrityError`;
+- uma `idempotencyKey` representa um pedido (coleção + caminho + conteúdo); usá-la
+  para outro pedido devolve 409;
+- caminho relativo é metadado: nunca vira leitura de filesystem, e caractere de
+  controle é recusado em vez de removido pelo `strip()`;
 - apenas o mestre da campanha enxerga as fontes.
 """
 
 import hashlib
+import json
+import sqlite3
 import unittest
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier, Thread
+from time import sleep
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.routers.campaigns import get_campaign_store
 from app.routers.preparation import get_preparation_store
-from app.services.campaign_store import CampaignStore
+from app.services.campaign_store import CampaignError, CampaignStore
 from app.services.preparation_store import PreparationStore
 
 COLLECTION = "campanha-victor"
+# atraso para duas importações concorrentes lerem o mesmo estado antes de escrever
+WINDOW_SECONDS = 0.35
 
 
 def checksum_of(text: str) -> str:
@@ -261,6 +276,29 @@ class PreparationSourceTests(unittest.TestCase):
         )
         self.assertEqual(restored["content"], "conteúdo persistente")
 
+    def test_reading_without_a_revision_returns_the_current_one(self):
+        """Sem número, a revisão atual: quem a conhece é o servidor, não o agent."""
+        user_id = self.store.user_for_token(self.gm["Authorization"][7:])["id"]
+        source_id = self.import_source("primeira versão").json()["source"]["id"]
+        self.import_source("segunda versão")
+
+        current = self.preparation.read_revision(user_id, self.campaign_id, source_id)
+        self.assertEqual(current["revision"], 2)
+        self.assertEqual(current["content"], "segunda versão")
+
+        older = self.preparation.read_revision(user_id, self.campaign_id, source_id, 1)
+        self.assertEqual(older["content"], "primeira versão")
+
+    def test_a_revision_that_does_not_exist_names_source_and_number(self):
+        user_id = self.store.user_for_token(self.gm["Authorization"][7:])["id"]
+        source_id = self.import_source("qualquer nota").json()["source"]["id"]
+
+        with self.assertRaises(CampaignError) as failure:
+            self.preparation.read_revision(user_id, self.campaign_id, source_id, 9)
+        self.assertEqual(failure.exception.status, 404)
+        self.assertIn("9", str(failure.exception))
+        self.assertIn(source_id, str(failure.exception))
+
     # ── autorização ────────────────────────────────────────────────────────
 
     def test_player_cannot_import_list_or_read_sources(self):
@@ -307,6 +345,158 @@ class PreparationSourceTests(unittest.TestCase):
         self.assertEqual(listed["items"], [])
 
 
+    # ── atomicidade e identidade da chave (correções da revisão da etapa 2) ──
+
+    def import_through_the_store(self, content, relative_path="notas.md", **extra):
+        """Importa direto no store, para poder disparar duas importações juntas."""
+        user_id = self.store.user_for_token(self.gm["Authorization"][7:])["id"]
+        try:
+            result = self.preparation.import_source(
+                user_id,
+                self.campaign_id,
+                collection_id=COLLECTION,
+                relative_path=relative_path,
+                title="Sessão 8",
+                content=content,
+                **extra,
+            )
+            return result["status"]
+        except CampaignError as error:
+            return str(error.status)
+
+    def run_together(self, jobs):
+        """Roda cada job em sua thread, todos disparados no mesmo instante."""
+        started = Barrier(len(jobs))
+        outcomes: list[str] = []
+
+        def run(content, **extra):
+            started.wait()
+            outcomes.append(self.import_through_the_store(content, **extra))
+
+        threads = [Thread(target=run, kwargs=kwargs) for kwargs in jobs]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return outcomes
+
+    @contextmanager
+    def widened_write_window(self) -> Iterator[None]:
+        """Abre a janela entre ler a fonte e escrever, onde a corrida acontecia.
+
+        Sem atraso as threads se serializam sozinhas e o teste verde por acaso. O
+        atraso entra depois da leitura da fonte e antes do `INSERT`.
+        """
+        original = PreparationStore._resolve_revision_precondition
+
+        def slow(existing, expected_revision):
+            sleep(WINDOW_SECONDS)
+            return original(existing, expected_revision)
+
+        with patch.object(
+            PreparationStore, "_resolve_revision_precondition", staticmethod(slow)
+        ):
+            yield
+
+    def preparation_rows(self, table):
+        with closing(self.store._connect()) as conn:
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    def test_concurrent_imports_of_one_file_do_not_collide(self):
+        """Duas importações juntas do mesmo caminho: uma cria, a outra acrescenta.
+
+        Sem a transação de escrita, as duas liam "não existe fonte" e disputavam o
+        `INSERT`; o índice único de identidade impedia a duplicação, mas a perdedora
+        voltava com `IntegrityError` (500) em vez de um resultado válido.
+        """
+        with self.widened_write_window():
+            outcomes = self.run_together([{"content": "texto A"}, {"content": "texto B"}])
+        self.assertEqual(sorted(outcomes), ["imported", "new_revision"])
+        self.assertEqual(self.preparation_rows("preparation_sources"), 1)
+        self.assertEqual(self.preparation_rows("preparation_source_revisions"), 2)
+
+    def test_concurrent_retries_of_one_key_import_once(self):
+        """Mesma chave em paralelo: uma importação, o retry devolve o mesmo resultado."""
+        with self.widened_write_window():
+            outcomes = self.run_together(
+                [
+                    {"content": "mesmo texto", "idempotency_key": "k-paralela"},
+                    {"content": "mesmo texto", "idempotency_key": "k-paralela"},
+                ]
+            )
+        self.assertEqual(outcomes, ["imported", "imported"])
+        self.assertEqual(self.preparation_rows("preparation_sources"), 1)
+        self.assertEqual(self.preparation_rows("preparation_source_revisions"), 1)
+        self.assertEqual(self.preparation_rows("preparation_imports"), 1)
+
+    def test_a_key_is_the_same_identity_on_read_and_on_write(self):
+        """A chave é normalizada uma vez: o retry idêntico devolve o resultado original.
+
+        Como a consulta normalizava e a gravação guardava o texto cru, o retry do
+        mesmo pedido não encontrava o resultado anterior e respondia `unchanged`.
+        """
+        first = self.import_source("notas com moldura", idempotencyKey=" spaced-key ")
+        self.assertEqual(first.status_code, 201, first.text)
+        self.assertEqual(first.json()["status"], "imported")
+
+        retry = self.import_source("notas com moldura", idempotencyKey=" spaced-key ")
+        self.assertEqual(retry.status_code, 201, retry.text)
+        self.assertEqual(retry.json(), first.json())
+        self.assertEqual(self.preparation_rows("preparation_source_revisions"), 1)
+
+    def test_reusing_a_key_for_another_import_conflicts(self):
+        """Chave identifica um pedido: reaproveitá-la para outra fonte é 409.
+
+        Sem isso, a mesma chave com `relativePath` diferentes criava duas fontes e
+        um único resultado idempotente — o retry deixava de ser retry.
+        """
+        first = self.import_source("primeira importação", idempotencyKey="chave-unica")
+        self.assertEqual(first.status_code, 201, first.text)
+
+        conflict = self.import_source(
+            "outro conteúdo",
+            relative_path="sessoes/outra.md",
+            idempotencyKey="chave-unica",
+        )
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertIn("idempotencyKey", conflict.text)
+        self.assertEqual(self.preparation_rows("preparation_sources"), 1)
+
+    def test_a_key_from_before_the_fingerprint_column_still_replays(self):
+        """Linha antiga (sem impressão digital) não vira conflito do nada.
+
+        A coluna `request_fingerprint` chega por `ALTER TABLE` num banco que já
+        está em produção, então linhas anteriores ficam sem valor e o contrato
+        antigo — devolver o resultado gravado — precisa continuar valendo.
+        """
+        legacy = {
+            "status": "imported",
+            "revision": 1,
+            "source": {},
+            "possibleDuplicates": [],
+        }
+        with closing(self.store._connect()) as conn, conn:
+            conn.execute(
+                """INSERT INTO preparation_imports
+                (campaign_id, idempotency_key, result, created_at)
+                VALUES (?, ?, ?, ?)""",
+                (self.campaign_id, "chave-antiga", json.dumps(legacy), "2026-01-01T00:00:00+00:00"),
+            )
+
+        replayed = self.import_through_the_store("qualquer conteúdo", idempotency_key="chave-antiga")
+        self.assertEqual(replayed, "imported")
+        self.assertEqual(self.preparation_rows("preparation_sources"), 0)
+
+    def test_control_characters_in_the_path_are_rejected_not_stripped(self):
+        """O `strip()` não pode esconder caminho corrompido: controle é recusado."""
+        for path in ("\nnotas.md\n", "notas\t.md", "notas\x00.md"):
+            with self.subTest(path=path):
+                refused = self.import_source("conteúdo", relative_path=path)
+                self.assertEqual(refused.status_code, 422, refused.text)
+                self.assertIn("controle", refused.text)
+        self.assertEqual(self.preparation_rows("preparation_sources"), 0)
+
+
 class PreparationMigrationTests(unittest.TestCase):
     """O deploy adiciona as tabelas novas sem tocar no que já existe no banco."""
 
@@ -316,6 +506,29 @@ class PreparationMigrationTests(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def test_reopening_adds_the_fingerprint_column_and_keeps_old_rows(self):
+        """O banco em produção tem `preparation_imports` sem a coluna nova.
+
+        Reabrir a store adiciona `request_fingerprint` por `ALTER TABLE` e não
+        toca nas linhas já gravadas — senão o deploy quebraria a mesa do Victor.
+        """
+        PreparationStore(self.database, CampaignStore(self.database))
+        with closing(sqlite3.connect(self.database)) as legacy, legacy:
+            legacy.execute("ALTER TABLE preparation_imports DROP COLUMN request_fingerprint")
+            legacy.execute(
+                """INSERT INTO preparation_imports
+                (campaign_id, idempotency_key, result, created_at)
+                VALUES ('campanha-antiga', 'chave', '{}', '2026-01-01T00:00:00+00:00')"""
+            )
+
+        PreparationStore(self.database, CampaignStore(self.database))
+
+        with closing(sqlite3.connect(self.database)) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(preparation_imports)")]
+            keys = [row[0] for row in conn.execute("SELECT idempotency_key FROM preparation_imports")]
+        self.assertIn("request_fingerprint", columns)
+        self.assertEqual(keys, ["chave"])
 
     def test_existing_rows_survive_and_revisions_are_immutable(self):
         store = CampaignStore(self.database)
