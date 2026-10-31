@@ -140,15 +140,16 @@ responde 421 — a proteção contra DNS rebinding do SDK fica ligada.
 | `connection_status` | campanha da credencial, permissões e limites (nunca mostra a credencial) |
 | `import_source` | recebe o texto bruto lido localmente; idempotente, cria revisão só se mudou |
 | `list_sources` / `search_sources` | metadados e busca textual nas fontes da campanha |
-| `read_source` | janela da revisão (padrão 8 000, máx. 20 000 caracteres) com `truncated`/`nextOffset` |
+| `read_source` | janela da revisão (padrão 8 000, máx. 20 000 caracteres) com `truncated`/`nextOffset`; para continuar, reenviar o `revision` lido antes — metade de cada revisão montaria uma nota que não existe |
 | `read_campaign_context` | sessões/encontros/NPCs/missões já existentes (id, nome, estado) |
-| `save_preparation_draft` | cria ou revisa proposta tipada ligada a `(sourceId, revision)` |
+| `save_preparation_draft` | cria ou revisa proposta tipada ligada a `(sourceId, revision)`; ao revisar, `sourceRefs` é obrigatório (limpar exige `[]`) |
 | `read_preparation_draft` | rascunho, vínculos, alvos possíveis e avisos de visibilidade |
 
 Não existe ferramenta de aplicar, publicar, excluir, iniciar combate ou ler
 filesystem remoto — e a store também recusa essas capacidades para a credencial,
 então a ausência de ferramenta não é a única barreira. Conteúdo por fonte: até
-200 000 caracteres; `sourceRefs` por rascunho: até 12.
+200 000 caracteres; `sourceRefs` por rascunho: até 20; `read_campaign_context`:
+até 50 entidades por tipo (as demais ficam fora até a paginação existir).
 
 Configuração (variáveis de ambiente, lista separada por vírgula):
 
@@ -156,7 +157,7 @@ Configuração (variáveis de ambiente, lista separada por vírgula):
 |---|---|---|
 | `MCP_PATH` | `/mcp` | as duas formas (`/mcp` e `/mcp/`) atendem sem redirect |
 | `MCP_ALLOWED_HOSTS` | `pharos-server.yagomaia.com.br` | `Host` liberado no túnel; **vazio desliga o endpoint** |
-| `MCP_ALLOWED_ORIGINS` | vazio | necessário só se o cliente enviar `Origin` |
+| `MCP_ALLOWED_ORIGINS` | vazio | vazio recusa **todo** `Origin` (403): só cliente que não manda o header, como o agent do mestre |
 
 No agent (OpenCode e afins), o servidor remoto entra com o header apontando para a
 variável que guarda a credencial — nunca a credencial escrita no arquivo:
