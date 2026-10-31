@@ -18,9 +18,12 @@ Regras verificadas:
 - o inventário é o do plano: sem aplicar, sem excluir, sem combate;
 - `campaignId` não é argumento de ferramenta: a campanha vem da credencial;
 - o conteúdo viaja fiel (acentos, CRLF, tab, emoji) e a resposta não repete o doc;
-- leitura devolve janela com truncamento explícito, nunca corte silencioso;
+- leitura devolve janela com truncamento explícito, nunca corte silencioso, e
+  continuar uma janela exige a revisão lida antes: as metades vêm da mesma revisão;
 - revisar rascunho exige reenviar `sourceRefs`: procedência não se perde por omissão;
 - o log de auditoria registra campanha e credencial, nunca a nota nem o token;
+- Host/Origin ruins são recusados antes de qualquer SQLite: ninguém de fora reserva
+  o escritor do banco com um Bearer inventado;
 - fonte de outra campanha não é alcançável daqui;
 - nada do que o MCP faz escreve registro oficial da campanha.
 """
@@ -39,7 +42,7 @@ from fastapi.testclient import TestClient
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from app.core.config import Settings
+from app.core.config import Settings, settings
 from app.main import app
 from app.preparation_mcp.server import (
     TOOL_NAMES,
@@ -48,6 +51,7 @@ from app.preparation_mcp.server import (
     mount_preparation_mcp,
 )
 from app.services.campaign_store import CampaignStore
+from app.services.preparation_draft_payloads import MAX_SOURCE_REFS, MAX_SQLITE_INTEGER
 from app.services.preparation_store import PreparationStore
 from app.services.preparation_tokens import PreparationTokenStore
 
@@ -72,6 +76,18 @@ def _lifespan(app):
     if isinstance(app, PreparationMcpApp):
         return app.lifespan()
     return app.router.lifespan_context(app)
+
+
+class CountingTokenStore:
+    """Embalagem que conta resoluções: recusa de transporte não pode gastar SQLite."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.resolutions = 0
+
+    def resolve(self, token: str):
+        self.resolutions += 1
+        return self.inner.resolve(token)
 
 
 class PreparationMcpTests(unittest.TestCase):
@@ -221,6 +237,7 @@ class PreparationMcpTests(unittest.TestCase):
 
     def test_a_revoked_credential_stops_mid_connection(self):
         """Revogar vale na hora, inclusive para a sessão MCP já aberta."""
+        self.assertEqual(self.http_probe(token=self.token).status_code, 200)
         self.tokens.revoke(self.gm_id, self.campaign_id, self.token_id)
         response = self.http_probe(token=self.token)
         self.assertEqual(response.status_code, 401)
@@ -241,6 +258,29 @@ class PreparationMcpTests(unittest.TestCase):
                 response = self.http_probe(token=self.token, origin=origin)
                 self.assertEqual(response.status_code, 403)
         self.assertEqual(self.http_probe(token=self.token).status_code, 200)
+
+    def test_a_transport_refusal_never_resolves_the_credential(self):
+        """Host/Origin ruins são recusados antes de qualquer SQLite.
+
+        `resolve` escreve (`last_used_at`) e a escrita é uma transação só: se a
+        credencial fosse resolvida primeiro, um Bearer inventado pela internet
+        disputaria o escritor do banco com as importações do mestre.
+        """
+        counter = CountingTokenStore(self.tokens)
+        guarded = build_preparation_mcp_asgi(
+            lambda: self.campaigns, lambda: self.sources,
+            allowed_hosts=[HOST], endpoint_path=ENDPOINT, tokens=lambda: counter,
+        )
+        for host, origin in (("evil.example.com", None), (HOST, "http://evil.example.com")):
+            with self.subTest(host=host, origin=origin):
+                response = self.http_probe(
+                    app=guarded, host=host, token=self.token, origin=origin
+                )
+                self.assertIn(response.status_code, (421, 403))
+        self.assertEqual(counter.resolutions, 0, "recusa de transporte não consulta o banco")
+
+        self.assertEqual(self.http_probe(app=guarded, token=self.token).status_code, 200)
+        self.assertEqual(counter.resolutions, 1, "pedido válido resolve a credencial")
 
     def test_the_endpoint_travels_with_the_host_app(self):
         """Produção é `app.mount` no FastAPI: o lifespan do transporte entra junto."""
@@ -312,6 +352,38 @@ class PreparationMcpTests(unittest.TestCase):
             for word in forbidden:
                 self.assertNotIn(word, name.lower(), f"{name} expõe {word}")
 
+    def constraint(self, argument: dict) -> dict:
+        """Limite de argumento opcional vem dentro de `anyOf`, não no nó raiz."""
+        if "anyOf" in argument:
+            return next(branch for branch in argument["anyOf"] if branch.get("type") != "null")
+        return argument
+
+    def test_the_advertised_limits_are_the_limits_the_tools_accept(self):
+        """Anunciar 20 vínculos e recusar 12 faria o agent perder proposta válida."""
+        schemas = self.schemas()
+        refs = self.constraint(schemas["save_preparation_draft"]["properties"]["sourceRefs"])
+        self.assertEqual(refs["maxItems"], MAX_SOURCE_REFS)
+        for name, argument in (
+            ("read_source", "revision"),
+            ("save_preparation_draft", "expectedRevision"),
+        ):
+            with self.subTest(tool=name, argument=argument):
+                bounds = self.constraint(schemas[name]["properties"][argument])
+                self.assertEqual(bounds["maximum"], MAX_SQLITE_INTEGER)
+                self.assertEqual(bounds["minimum"], 1)
+
+    def test_a_revision_beyond_the_sqlite_range_is_refused_before_the_database(self):
+        """A REST já limita esse inteiro; pelo MCP a recusa tem de ser a mesma regra.
+
+        Sem o limite no schema, o estouro estourava o binding do SQLite e o SDK
+        devolvia `Error executing tool` sem dizer o que estava errado.
+        """
+        source_id = self.imported_source_id()
+        result = self.call("read_source", {"sourceId": source_id, "revision": MAX_SQLITE_INTEGER + 1})
+        self.assertTrue(result.is_error)
+        self.assertIn(str(MAX_SQLITE_INTEGER), self.text_of(result), "o limite esperado aparece")
+        self.assertNotIn("sqlite", self.text_of(result).lower(), "o erro interno do driver não vaza")
+
     def test_calling_a_tool_that_is_not_exposed_does_nothing(self):
         for name in ("apply_preparation_draft", "launch_encounter", "delete_source"):
             with self.subTest(name=name):
@@ -366,15 +438,49 @@ class PreparationMcpTests(unittest.TestCase):
         self.assertEqual(window["nextOffset"], 300)
 
         rest = self.as_json(
-            self.call("read_source", {"sourceId": source_id, "offset": 300, "maxChars": 300})
+            self.call(
+                "read_source",
+                {
+                    "sourceId": source_id,
+                    "offset": 300,
+                    "maxChars": 300,
+                    "revision": window["revision"],
+                },
+            )
         )
         self.assertEqual(rest["content"], "x" * 300)
         self.assertEqual(rest["nextOffset"], 600)
 
+    def test_continuing_a_window_without_pinning_the_revision_is_refused(self):
+        """Continuar pelo `nextOffset` sem fixar a revisão misturaria duas revisões.
+
+        O contrato de fidelidade é por revisão: emendar a janela 1 da revisão 1 com
+        a janela 2 da revisão 2 produziria um texto que nunca existiu em lugar nenhum.
+        """
+        source_id = self.imported_source_id("A" * 10)
+        first = self.as_json(self.call("read_source", {"sourceId": source_id, "maxChars": 4}))
+        self.assertEqual(first["nextOffset"], 4)
+
+        self.imported_source_id("B" * 10, relativePath="sessoes/sessao-08.md",
+                                idempotencyKey="tentativa-2")
+
+        unguarded = self.call("read_source", {"sourceId": source_id, "offset": first["nextOffset"]})
+        self.assertTrue(unguarded.is_error, "continuar sem revisão tem de ser recusado")
+        self.assertIn("revision", self.text_of(unguarded))
+
+        pinned = self.as_json(self.call(
+            "read_source",
+            {"sourceId": source_id, "offset": 4, "maxChars": 4, "revision": first["revision"]},
+        ))
+        self.assertEqual(pinned["revision"], 1)
+        self.assertEqual(pinned["content"], "AAAA", "a continuação fica na revisão lida antes")
+
     def test_reading_past_the_end_reports_the_end_not_an_empty_window(self):
         """Offset além do documento não pode parecer "documento vazio aqui"."""
         source_id = self.imported_source_id("x" * 120)
-        past = self.as_json(self.call("read_source", {"sourceId": source_id, "offset": 5_000}))
+        past = self.as_json(
+            self.call("read_source", {"sourceId": source_id, "offset": 5_000, "revision": 1})
+        )
         self.assertEqual(past["offset"], 120, "o offset é trazido para o fim do documento")
         self.assertEqual(past["content"], "")
         self.assertEqual(past["returnedChars"], 0)
@@ -536,6 +642,34 @@ class PreparationMcpTests(unittest.TestCase):
         self.assertFalse(emptied.is_error, self.text_of(emptied))
         self.assertEqual(self.as_json(emptied)["sourceRefs"], [], "limpar exige [] explícito")
 
+    def test_revising_a_draft_keeps_the_target_and_notes_it_already_had(self):
+        """Mexer só no payload não pode virar proposta de criação nem apagar notas."""
+        source_id = self.imported_source_id()
+        npc = self.campaigns.create_npc(self.gm_id, self.campaign_id, "Ferrarin", "ferreiro")
+        created = self.as_json(self.call(
+            "save_preparation_draft",
+            {
+                "payload": {"kind": "npc", "name": "Ferrarin", "role": "ferreiro"},
+                "targetId": npc["id"],
+                "sourceRefs": [{"sourceId": source_id, "revision": 1}],
+                "uncertainties": ["nome conferido na sessão seguinte"],
+            },
+        ))
+        edited = self.call(
+            "save_preparation_draft",
+            {
+                "draftId": created["id"],
+                "expectedRevision": created["revision"],
+                "payload": {"kind": "npc", "name": "Ferrarin", "role": "contrabandista"},
+                "sourceRefs": [{"sourceId": source_id, "revision": 1}],
+            },
+        )
+        self.assertFalse(edited.is_error, self.text_of(edited))
+        draft = self.as_json(edited)
+        self.assertEqual(draft["targetId"], npc["id"], "omitir targetId não vira criação")
+        self.assertEqual(draft["uncertainties"], ["nome conferido na sessão seguinte"])
+        self.assertEqual(draft["payload"]["role"], "contrabandista")
+
     def test_read_campaign_context_shows_existing_entities_to_reuse(self):
         npc = self.campaigns.create_npc(self.gm_id, self.campaign_id, "Ferrarin", "ferreiro")
         listed = self.as_json(self.call("read_campaign_context", {"kind": "npcs"}))
@@ -601,25 +735,38 @@ class PreparationMcpSettingsTests(unittest.TestCase):
 
 
 class ShippedAppEndpointTests(unittest.TestCase):
-    def test_the_app_the_vps_runs_publishes_the_endpoint(self):
-        """/mcp existe no app real e recusa quem chega sem credencial."""
-        with TestClient(app) as client:
-            response = client.post(
-                "/mcp",
-                headers={"content-type": "application/json", "accept": "application/json"},
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {},
-                        "clientInfo": {"name": "curl", "version": "0"},
-                    },
+    """/mcp do app real: existe, exige credencial e só responde no Host configurado."""
+
+    def _initialize(self, client: TestClient):
+        return client.post(
+            "/mcp",
+            headers={"content-type": "application/json", "accept": "application/json"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "curl", "version": "0"},
                 },
-            )
+            },
+        )
+
+    def test_the_app_the_vps_runs_publishes_the_endpoint(self):
+        hosts = settings.mcp_allowed_hosts()
+        if not hosts:
+            self.skipTest("MCP_ALLOWED_HOSTS vazio aqui: o endpoint não é publicado")
+        with TestClient(app, base_url=f"http://{hosts[0]}") as client:
+            response = self._initialize(client)
         self.assertEqual(response.status_code, 401)
         self.assertIn("Bearer", response.headers.get("www-authenticate", ""))
+
+    def test_the_shipped_endpoint_refuses_another_host(self):
+        """O `Host` do túnel é lista fechada: DNS rebinding não entra no `/mcp`."""
+        with TestClient(app, base_url="http://algum-outro.example.com") as client:
+            response = self._initialize(client)
+        self.assertEqual(response.status_code, 421)
 
 
 if __name__ == "__main__":

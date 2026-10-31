@@ -149,6 +149,14 @@ class PreparationTools:
         """
         window = max(1, min(int(max_chars or 1), MAX_READ_WINDOW_CHARS))
         start = max(0, int(offset or 0))
+        if start and revision is None:
+            # `nextOffset` sem `revision` releria a revisão *atual*, que pode ter
+            # mudado entre uma janela e outra: as metades viriam de revisões
+            # diferentes e o agent montaria um texto que nunca existiu.
+            raise ToolError(
+                "422: ao continuar uma janela, reenviar o revision da leitura "
+                "anterior junto com o offset."
+            )
         stored = await self._call(
             "read_source", actor, self.sources.read_revision,
             actor.user_id, actor.campaign_id, source_id, revision,
@@ -257,6 +265,14 @@ class PreparationTools:
                 "rascunho antes e reenviar as fontes citadas; para desvincular, "
                 "enviar sourceRefs com lista vazia."
             )
+        if target_id is None:
+            # Omitir o alvo não pode transformar "atualiza o NPC X" em "cria um NPC
+            # novo": a intenção do rascunho é o que o mestre revisa antes de aplicar.
+            seen = await self._call(
+                "read_preparation_draft", actor, self.drafts.read_draft,
+                actor.user_id, actor.campaign_id, draft_id,
+            )
+            target_id = seen.get("targetId")
         return await self._call(
             "save_preparation_draft",
             actor,
@@ -267,8 +283,10 @@ class PreparationTools:
             payload=payload,
             expected_revision=expected_revision,
             target_id=target_id,
-            source_refs=list(source_refs or []),
-            uncertainties=list(uncertainties or []),
+            source_refs=list(source_refs),
+            # `None` passa direto: a store preserva as incertezas já escritas, e
+            # `[]` continua sendo a única forma de limpar a lista.
+            uncertainties=None if uncertainties is None else list(uncertainties),
         )
 
     async def read_preparation_draft(

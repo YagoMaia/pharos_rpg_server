@@ -139,14 +139,19 @@ class PreparationTokenStore:
         """
         if not token or not token.startswith(TOKEN_PREFIX):
             return None
-        with write_transaction(self.path) as conn:
+        # A procura é leitura: só uma credencial válida escreve `last_used_at`. Se a
+        # resolução abrisse `BEGIN IMMEDIATE` primeiro, qualquer `pharos_prep_...`
+        # inventado pela internet reservaria o escritor único do SQLite e disputaria
+        # com as importações do mestre.
+        with closing(open_connection(self.path)) as conn:
             row = conn.execute(
                 """SELECT id, campaign_id, created_by, revoked_at
                 FROM preparation_tokens WHERE token_hash = ?""",
                 (_digest(token),),
             ).fetchone()
-            if not row or row["revoked_at"]:
-                return None
+        if not row or row["revoked_at"]:
+            return None
+        with write_transaction(self.path) as conn:
             conn.execute(
                 "UPDATE preparation_tokens SET last_used_at = ? WHERE id = ?",
                 (utc_now(), row["id"]),

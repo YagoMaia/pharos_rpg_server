@@ -30,6 +30,7 @@ from starlette.types import Receive, Scope, Send
 from app.preparation_mcp.identity import (
     PreparationActor,
     PreparationAuthMiddleware,
+    ResolvesPreparationTokens,
     actor_from_scope,
 )
 from app.preparation_mcp.tools import (
@@ -38,6 +39,7 @@ from app.preparation_mcp.tools import (
     PreparationTools,
 )
 from app.services.campaign_store import CampaignStore
+from app.services.preparation_draft_payloads import MAX_SOURCE_REFS, MAX_SQLITE_INTEGER
 from app.services.preparation_drafts import build_draft_store
 from app.services.preparation_store import PreparationStore
 from app.services.preparation_tokens import PreparationTokenStore
@@ -63,15 +65,16 @@ INSTRUCTIONS = (
     "arquivo nem disco. Regras: (1) enviar o texto integral da nota, sem resumir, "
     "corrigir ou reformatar; (2) uma idempotencyKey nova por tentativa de "
     "importação — repetir o mesmo pedido devolve o resultado anterior; (3) se a "
-    "nota é grande, reler por partes usando truncated/nextOffset em vez de assumir "
-    "que viu tudo; (4) organizar acontece em rascunhos, que citam (sourceId, "
-    "revision) exatos; (5) nenhum rascunho é aplicado por aqui: quem aprova e "
-    "aplica é o mestre, no app. Não existe ferramenta de combate, publicação, "
-    "exclusão ou aplicação nesta conexão."
+    "nota é grande, reler por partes usando truncated/nextOffset e reenviando o "
+    "revision lido antes, em vez de assumir que viu tudo; (4) organizar acontece "
+    "em rascunhos, que citam (sourceId, revision) exatos; (5) nenhum rascunho é "
+    "aplicado por aqui: quem aprova e aplica é o mestre, no app. Não existe "
+    "ferramenta de combate, publicação, exclusão ou aplicação nesta conexão."
 )
 
 CampaignStoreFactory = Callable[[], CampaignStore]
 PreparationStoreFactory = Callable[[], PreparationStore]
+TokenStoreFactory = Callable[[], ResolvesPreparationTokens]
 
 
 def _actor_of(ctx: Context) -> PreparationActor:
@@ -111,7 +114,7 @@ def register_tools(mcp: MCPServer, tools: PreparationTools) -> None:
         content: str,
         ctx: Context,
         idempotencyKey: Annotated[str | None, Field(max_length=120)] = None,
-        expectedRevision: Annotated[int | None, Field(ge=1)] = None,
+        expectedRevision: Annotated[int | None, Field(ge=1, le=MAX_SQLITE_INTEGER)] = None,
     ) -> dict[str, Any]:
         return await tools.import_source(
             _actor_of(ctx),
@@ -168,14 +171,14 @@ def register_tools(mcp: MCPServer, tools: PreparationTools) -> None:
         description=(
             "Lê uma janela de uma revisão da fonte, na ordem em que foi guardada. "
             "Sem `revision` lê a revisão atual. `truncated`/`nextOffset` indicam "
-            "que há mais texto: reler a partir do offset em vez de presumir que o "
-            "documento inteiro foi visto."
+            "que há mais texto: reler a partir do offset reenviando o `revision` "
+            "da leitura anterior, para não misturar revisões."
         ),
     )
     async def read_source(
         sourceId: Annotated[str, Field(min_length=1, max_length=64)],
         ctx: Context,
-        revision: Annotated[int | None, Field(ge=1)] = None,
+        revision: Annotated[int | None, Field(ge=1, le=MAX_SQLITE_INTEGER)] = None,
         offset: Annotated[int, Field(ge=0)] = 0,
         maxChars: Annotated[int, Field(ge=1, le=20_000)] = DEFAULT_READ_WINDOW_CHARS,
     ) -> dict[str, Any]:
@@ -214,10 +217,10 @@ def register_tools(mcp: MCPServer, tools: PreparationTools) -> None:
         payload: Annotated[dict[str, Any], Field(description="objeto com 'kind'")],
         ctx: Context,
         draftId: Annotated[str | None, Field(max_length=64)] = None,
-        expectedRevision: Annotated[int | None, Field(ge=1)] = None,
+        expectedRevision: Annotated[int | None, Field(ge=1, le=MAX_SQLITE_INTEGER)] = None,
         targetId: Annotated[str | None, Field(max_length=64)] = None,
         sourceRefs: Annotated[
-            list[dict[str, Any]] | None, Field(max_length=12)
+            list[dict[str, Any]] | None, Field(max_length=MAX_SOURCE_REFS)
         ] = None,
         uncertainties: Annotated[
             list[Annotated[str, Field(max_length=500)]] | None, Field(max_length=20)
@@ -309,6 +312,7 @@ def build_preparation_mcp_asgi(
     allowed_hosts: Sequence[str],
     allowed_origins: Sequence[str] = (),
     endpoint_path: str = "/",
+    tokens: TokenStoreFactory | None = None,
 ) -> PreparationMcpApp:
     """App ASGI do MCP: credencial + transporte Streamable HTTP + ferramentas.
 
@@ -324,7 +328,7 @@ def build_preparation_mcp_asgi(
         )
     return PreparationMcpApp(
         lambda: _preparation_transport(
-            campaigns, sources, hosts, list(allowed_origins), endpoint_path
+            campaigns, sources, hosts, list(allowed_origins), endpoint_path, tokens
         ),
         endpoint_path,
     )
@@ -336,6 +340,7 @@ def _preparation_transport(
     hosts: Sequence[str],
     allowed_origins: Sequence[str],
     endpoint_path: str,
+    tokens: TokenStoreFactory | None = None,
 ) -> Starlette:
     """Uma instância do transporte, com as stores injetadas pelas fábricas."""
     campaign_store = campaigns()
@@ -345,23 +350,32 @@ def _preparation_transport(
         sources=source_store,
         drafts=build_draft_store(str(source_store.path), campaign_store, source_store),
     )
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=list(hosts),
+        allowed_origins=[origin.strip() for origin in allowed_origins if origin.strip()],
+    )
     mcp = MCPServer(name=SERVER_NAME, instructions=INSTRUCTIONS)
     register_tools(mcp, tools)
     app = mcp.streamable_http_app(
         streamable_http_path=endpoint_path,
         stateless_http=True,
         json_response=True,
-        transport_security=TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=list(hosts),
-            allowed_origins=[origin.strip() for origin in allowed_origins if origin.strip()],
-        ),
+        transport_security=security,
     )
     app.add_middleware(
         PreparationAuthMiddleware,
-        tokens=PreparationTokenStore(campaign_store.path, campaign_store),
+        tokens=(tokens or _token_store_for(campaign_store))(),
+        security=security,
     )
     return app
+
+
+def _token_store_for(campaign_store: CampaignStore) -> TokenStoreFactory:
+    def built() -> PreparationTokenStore:
+        return PreparationTokenStore(campaign_store.path, campaign_store)
+
+    return built
 
 
 def mount_preparation_mcp(
