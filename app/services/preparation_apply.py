@@ -112,7 +112,21 @@ class PreparationApplyStore:
         *,
         idempotency_key: str | None = None,
         acknowledge_player_visibility: bool = False,
+        via_preparation_token: bool = False,
     ) -> dict[str, Any]:
+        """Aplica um rascunho como o mestre logado no app.
+
+        `via_preparation_token` vem do roteador: quando a identidade veio da
+        credencial do agent, a aplicação é recusada antes de qualquer leitura. O
+        plano é explícito (§5): "`approved` enviado pelo modelo não comprova
+        consentimento humano" — o agent importa e propõe, quem publica é o mestre.
+        """
+        if via_preparation_token:
+            raise CampaignError(
+                403,
+                "aplicar rascunho exige aprovação humana do mestre no app; a "
+                "credencial de preparação do agent cria e propõe, não publica.",
+            )
         self.campaigns.assert_gm(user_id, campaign_id)
         with closing(self._connect()) as conn, conn:
             draft = self.drafts.draft_row(conn, campaign_id, draft_id)
