@@ -18,7 +18,12 @@ Regras que o contrato depende:
   encaminhou todos os bytes de um arquivo local que o servidor nunca abriu.
 - Caminho relativo é **metadado de origem**. Ele nunca é usado para abrir
   arquivo algum, nem para montar caminho no disco do servidor.
-- Revisões são imutáveis e a importação é idempotente por `idempotencyKey`.
+- Revisões são imutáveis e a importação é idempotente por `idempotencyKey`. A
+  consulta da chave, a leitura da fonte e a escrita acontecem na MESMA transação
+  (`BEGIN IMMEDIATE`): fora dela, duas importações juntas liam o mesmo estado e a
+  perdedora explodia em `IntegrityError` (500) em vez de receber o resultado do
+  vencedor. A chave vale para um pedido (coleção + caminho + conteúdo); usá-la para
+  outro pedido é conflito, não sobrescrita.
 """
 
 import hashlib
@@ -30,6 +35,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.core.database import open_connection, write_transaction
 from app.services.campaign_store import CampaignError, CampaignStore
 
 MAX_CONTENT_CHARS = 200_000
@@ -41,6 +47,9 @@ MAX_PAGE_SIZE = 100
 DEFAULT_PAGE_SIZE = 25
 MAX_DUPLICATE_HINTS = 5
 
+# colunas acrescentadas depois da primeira versão de `preparation_imports`
+IMPORT_OPTIONAL_COLUMNS = (("request_fingerprint", "TEXT"),)
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -49,6 +58,22 @@ def utc_now() -> str:
 def checksum_of(content: str) -> str:
     """SHA-256 do conteúdo na representação UTF-8 definida pelo contrato."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def request_fingerprint(collection_id: str, relative_path: str, content: str) -> str:
+    """Identidade do pedido de importação: a chave não pode virar curinga.
+
+    Uma `idempotencyKey` representa um pedido, não a campanha inteira. Guardar esta
+    impressão digital junto do resultado permite devolver o replay para o retry e
+    recusar (409) quem reutiliza a mesma chave para outro arquivo.
+
+    >>> request_fingerprint("c", "a.md", "x") == request_fingerprint("c", "a.md", "x")
+    True
+    >>> request_fingerprint("c", "a.md", "x") == request_fingerprint("c", "b.md", "x")
+    False
+    """
+    identity = f"{collection_id}\n{relative_path}\n{checksum_of(content)}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def normalize_relative_path(raw: str) -> str:
@@ -65,15 +90,20 @@ def normalize_relative_path(raw: str) -> str:
         ...
     app.services.campaign_store.CampaignError: Caminho inválido: '..' não é permitido ...
     """
-    candidate = (raw or "").strip().replace("\\", "/")
+    candidate = raw or ""
+    # caracteres de controle são olhados no valor recebido: dar `strip()` antes
+    # aceitaria "\nnotas.md\n" como "notas.md", escondendo o dado corrompido
+    if any(ord(char) < 32 or ord(char) == 127 for char in candidate):
+        raise CampaignError(
+            422, f"Caminho não pode conter caracteres de controle: {raw!r}."
+        )
+    candidate = candidate.strip().replace("\\", "/")
     if not candidate:
         raise CampaignError(422, "Caminho obrigatório (ex.: sessoes/sessao-08.md).")
     if len(candidate) > MAX_PATH_CHARS:
         raise CampaignError(
             422, f"Caminho deve ter no máximo {MAX_PATH_CHARS} caracteres."
         )
-    if any(ord(char) < 32 or ord(char) == 127 for char in candidate):
-        raise CampaignError(422, "Caminho não pode conter caracteres de controle.")
     if candidate.startswith("/") or candidate[1:2] == ":":
         raise CampaignError(
             422,
@@ -128,16 +158,30 @@ class PreparationStore:
                     idempotency_key TEXT NOT NULL,
                     result TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    request_fingerprint TEXT,
                     PRIMARY KEY (campaign_id, idempotency_key)
                 );
                 """
             )
+            self._ensure_optional_columns(conn)
 
+    def _ensure_optional_columns(self, conn: sqlite3.Connection) -> None:
+        """Adiciona colunas criadas depois da primeira versão das tabelas.
+
+        `ALTER TABLE ADD COLUMN` basta aqui: `request_fingerprint` é metadado de
+        detecção de reuso de chave, e o único leitor (`_replayed_result`) trata
+        linha sem impressão digital como o comportamento antigo (devolver o replay).
+        """
+        existing = {
+            row["name"] for row in conn.execute("PRAGMA table_info(preparation_imports)")
+        }
+        for column, declaration in IMPORT_OPTIONAL_COLUMNS:
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE preparation_imports ADD COLUMN {column} {declaration}"
+                )
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        return open_connection(self.path)
 
     # ── escrita ────────────────────────────────────────────────────────────
 
@@ -153,15 +197,23 @@ class PreparationStore:
         idempotency_key: str | None = None,
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
-        """Importa conteúdo bruto, criando revisão apenas quando o texto mudou."""
+        """Importa conteúdo bruto, criando revisão apenas quando o texto mudou.
+
+        Decidir "esta chave já rodou?", "esta fonte já existe?", "qual é a próxima
+        revisão?" e depois escrever formam uma seção crítica só: tudo corre dentro
+        de `write_transaction` (`BEGIN IMMEDIATE`). Lembre que o `sqlite3` abre
+        transação apenas no primeiro DML, então ler antes de escrever sem isso vê um
+        estado que já mudou na hora do `INSERT`.
+        """
         collection = self._clean_text(collection_id, MAX_COLLECTION_CHARS, "coleção")
         clean_title = self._clean_text(title, MAX_TITLE_CHARS, "título")
         path = normalize_relative_path(relative_path)
         self._check_content(content)
+        key = self._idempotency_key(idempotency_key)
         self.campaigns.assert_gm(user_id, campaign_id)
 
-        with closing(self._connect()) as conn, conn:
-            replay = self._replayed_result(conn, campaign_id, idempotency_key)
+        with write_transaction(self.path) as conn:
+            replay = self._replayed_result(conn, campaign_id, key, collection, path, content)
             if replay is not None:
                 return replay
 
@@ -174,13 +226,28 @@ class PreparationStore:
             if conflict is not None:
                 raise conflict
 
-            result = (
-                self._append_revision(conn, existing, content, campaign_id)
-                if existing
-                else self._create_source(conn, campaign_id, collection, path, clean_title, content)
-            )
-            self._remember_import(conn, campaign_id, idempotency_key, result)
+            try:
+                result = (
+                    self._append_revision(conn, existing, content, campaign_id)
+                    if existing
+                    else self._create_source(
+                        conn, campaign_id, collection, path, clean_title, content
+                    )
+                )
+            except sqlite3.IntegrityError as error:
+                # dentro da transação de escrita isto não deveria acontecer; se
+                # acontecer, o contrato é conflito lido, não o 500 do driver
+                raise self._identity_conflict(collection, path) from error
+            self._remember_import(conn, campaign_id, key, result, collection, path, content)
             return result
+
+    @staticmethod
+    def _identity_conflict(collection: str, path: str) -> CampaignError:
+        return CampaignError(
+            409,
+            f"a fonte {collection}/{path} foi escrita por outro pedido neste "
+            "meio-tempo. Reler a fonte antes de importar de novo.",
+        )
 
     def _create_source(
         self,
@@ -287,18 +354,33 @@ class PreparationStore:
         }
 
     def read_revision(
-        self, user_id: str, campaign_id: str, source_id: str, revision: int
+        self,
+        user_id: str,
+        campaign_id: str,
+        source_id: str,
+        revision: int | None = None,
     ) -> dict[str, Any]:
+        """Uma revisão da fonte; sem número, a atual.
+
+        `revision=None` é o que o MCP precisa: o agent aponta para a fonte e o
+        servidor decide qual é a revisão corrente, em vez de o modelo adivinhar.
+        """
         self.campaigns.assert_gm(user_id, campaign_id)
         with closing(self._connect()) as conn:
             row = conn.execute(
                 """SELECT r.*, s.relative_path, s.title FROM preparation_source_revisions r
                 JOIN preparation_sources s ON s.id = r.source_id
-                WHERE r.source_id = ? AND r.revision = ? AND s.campaign_id = ?""",
-                (source_id, int(revision), campaign_id),
+                WHERE r.source_id = ? AND s.campaign_id = ?
+                  AND r.revision = COALESCE(?, s.current_revision)""",
+                (source_id, campaign_id, None if revision is None else int(revision)),
             ).fetchone()
             if not row:
-                raise CampaignError(404, "Revisão da fonte não encontrada.")
+                wanted = "atual" if revision is None else str(int(revision))
+                raise CampaignError(
+                    404,
+                    f"Revisão {wanted} da fonte {source_id} não existe nesta "
+                    "campanha. Listar as fontes para ver o número da revisão.",
+                )
             return {
                 "sourceId": row["source_id"],
                 "revision": row["revision"],
@@ -310,6 +392,21 @@ class PreparationStore:
                 "contentBytes": row["content_bytes"],
                 "importedAt": row["imported_at"],
             }
+
+    def has_revision(self, campaign_id: str, source_id: str, revision: int) -> bool:
+        """A revisão existe nessa campanha? Chamado após `assert_gm` do chamador.
+
+        Existe para o `PreparationDraftStore` validar `(sourceId, revision)` sem
+        copiar SQL das fontes. Não autoriza: quem chama já autorizou.
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT 1 FROM preparation_source_revisions r
+                JOIN preparation_sources s ON s.id = r.source_id
+                WHERE r.source_id = ? AND r.revision = ? AND s.campaign_id = ?""",
+                (source_id, int(revision), campaign_id),
+            ).fetchone()
+            return row is not None
 
     # ── auxiliares ─────────────────────────────────────────────────────────
 
@@ -382,26 +479,71 @@ class PreparationStore:
         return None
 
     @staticmethod
+    def _idempotency_key(value: str | None) -> str | None:
+        """Identidade única da chave: o mesmo valor vale para a consulta e a gravação.
+
+        Normalizar só na leitura fazia `"chave "` e `"chave"` serem registros
+        diferentes, então o retry do mesmo pedido não encontrava o resultado antigo.
+        """
+        if value is None:
+            return None
+        return PreparationStore._clean_text(value, MAX_IDEMPOTENCY_KEY_CHARS, "idempotencyKey")
+
+    @staticmethod
     def _replayed_result(
-        conn: sqlite3.Connection, campaign_id: str, idempotency_key: str | None
+        conn: sqlite3.Connection,
+        campaign_id: str,
+        key: str | None,
+        collection: str,
+        path: str,
+        content: str,
     ) -> dict[str, Any] | None:
-        if not idempotency_key:
+        """Resultado já produzido por esta chave, se o pedido for o mesmo."""
+        if key is None:
             return None
         row = conn.execute(
-            "SELECT result FROM preparation_imports WHERE campaign_id = ? AND idempotency_key = ?",
-            (campaign_id, PreparationStore._clean_text(idempotency_key, MAX_IDEMPOTENCY_KEY_CHARS, "idempotencyKey")),
+            """SELECT result, request_fingerprint FROM preparation_imports
+            WHERE campaign_id = ? AND idempotency_key = ?""",
+            (campaign_id, key),
         ).fetchone()
-        return json.loads(row["result"]) if row else None
+        if row is None:
+            return None
+        fingerprint = request_fingerprint(collection, path, content)
+        if row["request_fingerprint"] not in (None, fingerprint):
+            raise CampaignError(
+                409,
+                f"a idempotencyKey {key} já registrou outra importação nesta "
+                "campanha (coleção, caminho ou conteúdo diferentes). Repetir o mesmo "
+                "pedido devolve o resultado anterior; importar outra fonte exige "
+                "outra chave.",
+            )
+        # `request_fingerprint` é vazio em linhas anteriores à coluna: sem como
+        # comparar, mantém-se o contrato antigo de devolver o resultado gravado
+        return json.loads(row["result"])
 
     @staticmethod
     def _remember_import(
-        conn: sqlite3.Connection, campaign_id: str, idempotency_key: str | None, result: dict
+        conn: sqlite3.Connection,
+        campaign_id: str,
+        key: str | None,
+        result: dict,
+        collection: str,
+        path: str,
+        content: str,
     ) -> None:
-        if not idempotency_key:
+        if key is None:
             return
         conn.execute(
-            "INSERT OR IGNORE INTO preparation_imports VALUES (?, ?, ?, ?)",
-            (campaign_id, idempotency_key, json.dumps(result), utc_now()),
+            """INSERT INTO preparation_imports
+            (campaign_id, idempotency_key, result, request_fingerprint, created_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                campaign_id,
+                key,
+                json.dumps(result),
+                request_fingerprint(collection, path, content),
+                utc_now(),
+            ),
         )
 
     @staticmethod

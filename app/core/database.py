@@ -17,6 +17,8 @@ O procedimento correto está em `docs/DEPLOYMENT_DOCKER.md` (repo do frontend).
 """
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 LOCK_WAIT_SECONDS = 5
@@ -35,3 +37,32 @@ def open_connection(path: str | Path) -> sqlite3.Connection:
     connection.execute("PRAGMA journal_mode = WAL")
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
+
+
+@contextmanager
+def write_transaction(path: str | Path) -> Iterator[sqlite3.Connection]:
+    """Conexão que já entra em transação de escrita (`BEGIN IMMEDIATE`).
+
+    O padrão do `sqlite3` só abre transação no primeiro DML, então um fluxo
+    "lê, decide, escreve" lê *fora* da transação. Com WAL, dois fluxos assim podem
+    ler o mesmo estado e o segundo `COMMIT` falha com `database is locked` — o
+    cliente recebe 500 quando o certo seria 409. `BEGIN IMMEDIATE` pega o lock de
+    escrita antes do primeiro `SELECT`: o concorrente espera e depois vê o estado
+    novo, enquanto o `WHERE ... AND revision = ?` da escrita decide quem ganha.
+
+    >>> with write_transaction(":memory:") as conn:
+    ...     _ = conn.execute("CREATE TABLE t (v TEXT)")
+    ...     _ = conn.execute("INSERT INTO t VALUES ('escrito')")
+    ...     conn.execute("SELECT v FROM t").fetchone()[0]
+    'escrito'
+    """
+    connection = open_connection(path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        yield connection
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()

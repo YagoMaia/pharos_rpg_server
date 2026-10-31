@@ -1,22 +1,21 @@
 """Persistência local de campanhas; uma conexão SQLite por operação."""
 
-from contextlib import closing
-from datetime import datetime, timezone
 import hashlib
 import json
-from pathlib import Path
 import secrets
 import sqlite3
 import time
+from contextlib import closing
+from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 from app.core.database import open_connection
+from app.services import campaign_records as records
 
-
-class CampaignError(Exception):
-    def __init__(self, status: int, message: str):
-        self.status = status
-        super().__init__(message)
+# Reexportado: `from app.services.campaign_store import CampaignError` já é o
+# caminho usado por rotas, stores de preparação e testes.
+from app.services.errors import CampaignError
 
 
 def _digest(value: str) -> str:
@@ -366,7 +365,7 @@ class CampaignStore:
             return {
                 "code": code,
                 "expiresAt": datetime.fromtimestamp(
-                    expires_at, timezone.utc
+                    expires_at, UTC
                 ).isoformat(),
             }
 
@@ -482,7 +481,7 @@ class CampaignStore:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode criar notas.")
             entry_id = str(uuid4())
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(UTC).isoformat()
             conn.execute(
                 """INSERT INTO journal_entries VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (entry_id, campaign_id, title, body, visibility, now, now),
@@ -515,7 +514,7 @@ class CampaignStore:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode editar notas.")
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(UTC).isoformat()
             updated = conn.execute(
                 """UPDATE journal_entries
                 SET title = ?, body = ?, visibility = ?, updated_at = ?
@@ -578,25 +577,17 @@ class CampaignStore:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode gerenciar sessões.")
-            session_id = str(uuid4())
-            now = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                """INSERT INTO campaign_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    campaign_id,
-                    session_number,
-                    title.strip(),
-                    summary.strip(),
-                    scheduled_at,
-                    status,
-                    now,
-                    now,
-                ),
+            row = records.insert_session(
+                conn,
+                campaign_id,
+                {
+                    "session_number": session_number,
+                    "title": title.strip(),
+                    "summary": summary.strip(),
+                    "scheduled_at": scheduled_at,
+                    "status": status,
+                },
             )
-            row = conn.execute(
-                "SELECT * FROM campaign_sessions WHERE id = ?", (session_id,)
-            ).fetchone()
             return self._session(row)
 
     def update_session(
@@ -613,27 +604,18 @@ class CampaignStore:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode editar sessões.")
-            now = datetime.now(timezone.utc).isoformat()
-            updated = conn.execute(
-                """UPDATE campaign_sessions
-                SET session_number = ?, title = ?, summary = ?, scheduled_at = ?, status = ?, updated_at = ?
-                WHERE id = ? AND campaign_id = ?""",
-                (
-                    session_number,
-                    title.strip(),
-                    summary.strip(),
-                    scheduled_at,
-                    status,
-                    now,
-                    session_id,
-                    campaign_id,
-                ),
+            row = records.update_session(
+                conn,
+                campaign_id,
+                session_id,
+                {
+                    "session_number": session_number,
+                    "title": title.strip(),
+                    "summary": summary.strip(),
+                    "scheduled_at": scheduled_at,
+                    "status": status,
+                },
             )
-            if updated.rowcount == 0:
-                raise CampaignError(404, "Sessão não encontrada.")
-            row = conn.execute(
-                "SELECT * FROM campaign_sessions WHERE id = ?", (session_id,)
-            ).fetchone()
             return self._session(row)
 
     def delete_session(self, user_id: str, campaign_id: str, session_id: str) -> None:
@@ -685,25 +667,17 @@ class CampaignStore:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode gerenciar missões.")
-            quest_id = str(uuid4())
-            now = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                """INSERT INTO campaign_quests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    quest_id,
-                    campaign_id,
-                    title.strip(),
-                    description.strip(),
-                    reward.strip(),
-                    status,
-                    visibility,
-                    now,
-                    now,
-                ),
+            row = records.insert_quest(
+                conn,
+                campaign_id,
+                {
+                    "title": title.strip(),
+                    "description": description.strip(),
+                    "reward": reward.strip(),
+                    "status": status,
+                    "visibility": visibility,
+                },
             )
-            row = conn.execute(
-                "SELECT * FROM campaign_quests WHERE id = ?", (quest_id,)
-            ).fetchone()
             return self._quest(row)
 
     def update_quest(
@@ -720,27 +694,18 @@ class CampaignStore:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode editar missões.")
-            now = datetime.now(timezone.utc).isoformat()
-            updated = conn.execute(
-                """UPDATE campaign_quests
-                SET title = ?, description = ?, reward = ?, visibility = ?, status = ?, updated_at = ?
-                WHERE id = ? AND campaign_id = ?""",
-                (
-                    title.strip(),
-                    description.strip(),
-                    reward.strip(),
-                    visibility,
-                    status,
-                    now,
-                    quest_id,
-                    campaign_id,
-                ),
+            row = records.update_quest(
+                conn,
+                campaign_id,
+                quest_id,
+                {
+                    "title": title.strip(),
+                    "description": description.strip(),
+                    "reward": reward.strip(),
+                    "visibility": visibility,
+                    "status": status,
+                },
             )
-            if updated.rowcount == 0:
-                raise CampaignError(404, "Missão não encontrada.")
-            row = conn.execute(
-                "SELECT * FROM campaign_quests WHERE id = ?", (quest_id,)
-            ).fetchone()
             return self._quest(row)
 
     def delete_quest(self, user_id: str, campaign_id: str, quest_id: str) -> None:
@@ -814,27 +779,18 @@ class CampaignStore:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode criar encontros.")
-            encounter_id = str(uuid4())
-            now = datetime.now(timezone.utc).isoformat()
-            monsters_json = json.dumps(monsters_data or [])
-            conn.execute(
-                """INSERT INTO campaign_encounters VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    encounter_id,
-                    campaign_id,
-                    name.strip(),
-                    description.strip(),
-                    tactics.strip(),
-                    rewards.strip(),
-                    status,
-                    monsters_json,
-                    now,
-                    now,
-                ),
+            row = records.insert_encounter(
+                conn,
+                campaign_id,
+                {
+                    "name": name.strip(),
+                    "description": description.strip(),
+                    "tactics": tactics.strip(),
+                    "rewards": rewards.strip(),
+                    "status": status,
+                    "monsters_data": monsters_data,
+                },
             )
-            row = conn.execute(
-                "SELECT * FROM campaign_encounters WHERE id = ?", (encounter_id,)
-            ).fetchone()
             return self._encounter(row)
 
     def update_encounter(
@@ -852,29 +808,19 @@ class CampaignStore:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode editar encontros.")
-            now = datetime.now(timezone.utc).isoformat()
-            monsters_json = json.dumps(monsters_data or [])
-            updated = conn.execute(
-                """UPDATE campaign_encounters
-                SET name = ?, description = ?, tactics = ?, rewards = ?, status = ?, monsters_data = ?, updated_at = ?
-                WHERE id = ? AND campaign_id = ?""",
-                (
-                    name.strip(),
-                    description.strip(),
-                    tactics.strip(),
-                    rewards.strip(),
-                    status,
-                    monsters_json,
-                    now,
-                    encounter_id,
-                    campaign_id,
-                ),
+            row = records.update_encounter(
+                conn,
+                campaign_id,
+                encounter_id,
+                {
+                    "name": name.strip(),
+                    "description": description.strip(),
+                    "tactics": tactics.strip(),
+                    "rewards": rewards.strip(),
+                    "status": status,
+                    "monsters_data": monsters_data,
+                },
             )
-            if updated.rowcount == 0:
-                raise CampaignError(404, "Encontro não encontrado.")
-            row = conn.execute(
-                "SELECT * FROM campaign_encounters WHERE id = ?", (encounter_id,)
-            ).fetchone()
             return self._encounter(row)
 
     def delete_encounter(self, user_id: str, campaign_id: str, encounter_id: str) -> None:
@@ -948,28 +894,19 @@ class CampaignStore:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode criar NPCs.")
-            npc_id = str(uuid4())
-            now = datetime.now(timezone.utc).isoformat()
-            combat_json = json.dumps(combat_data) if combat_data else None
-            conn.execute(
-                """INSERT INTO campaign_npcs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    npc_id,
-                    campaign_id,
-                    name.strip(),
-                    role.strip(),
-                    attitude,
-                    description.strip(),
-                    gm_notes.strip(),
-                    combat_json,
-                    visibility,
-                    now,
-                    now,
-                ),
+            row = records.insert_npc(
+                conn,
+                campaign_id,
+                {
+                    "name": name.strip(),
+                    "role": role.strip(),
+                    "attitude": attitude,
+                    "description": description.strip(),
+                    "gm_notes": gm_notes.strip(),
+                    "combat_data": combat_data,
+                    "visibility": visibility,
+                },
             )
-            row = conn.execute(
-                "SELECT * FROM campaign_npcs WHERE id = ?", (npc_id,)
-            ).fetchone()
             return self._npc(row, is_gm=True)
 
     def update_npc(
@@ -988,31 +925,20 @@ class CampaignStore:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode editar NPCs.")
-            now = datetime.now(timezone.utc).isoformat()
-            combat_json = json.dumps(combat_data) if combat_data else None
-            updated = conn.execute(
-                """UPDATE campaign_npcs
-                SET name = ?, role = ?, attitude = ?, description = ?, gm_notes = ?,
-                    combat_data = ?, visibility = ?, updated_at = ?
-                WHERE id = ? AND campaign_id = ?""",
-                (
-                    name.strip(),
-                    role.strip(),
-                    attitude,
-                    description.strip(),
-                    gm_notes.strip(),
-                    combat_json,
-                    visibility,
-                    now,
-                    npc_id,
-                    campaign_id,
-                ),
+            row = records.update_npc(
+                conn,
+                campaign_id,
+                npc_id,
+                {
+                    "name": name.strip(),
+                    "role": role.strip(),
+                    "attitude": attitude,
+                    "description": description.strip(),
+                    "gm_notes": gm_notes.strip(),
+                    "combat_data": combat_data,
+                    "visibility": visibility,
+                },
             )
-            if updated.rowcount == 0:
-                raise CampaignError(404, "NPC não encontrado.")
-            row = conn.execute(
-                "SELECT * FROM campaign_npcs WHERE id = ?", (npc_id,)
-            ).fetchone()
             return self._npc(row, is_gm=True)
 
     def delete_npc(self, user_id: str, campaign_id: str, npc_id: str) -> None:
@@ -1056,7 +982,7 @@ class CampaignStore:
         updated_at: str | None = None,
     ) -> dict:
         tid = template_id or str(uuid4())
-        now = updated_at or datetime.now(timezone.utc).isoformat()
+        now = updated_at or datetime.now(UTC).isoformat()
         clean_name = name.strip()
         if not clean_name:
             raise CampaignError(400, "Nome do template é obrigatório.")
@@ -1079,7 +1005,7 @@ class CampaignStore:
         template_data: dict | None = None,
         updated_at: str | None = None,
     ) -> dict:
-        now = updated_at or datetime.now(timezone.utc).isoformat()
+        now = updated_at or datetime.now(UTC).isoformat()
         clean_name = name.strip()
         if not clean_name:
             raise CampaignError(400, "Nome do template é obrigatório.")
@@ -1114,7 +1040,7 @@ class CampaignStore:
                 ).fetchall()
             }
 
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(UTC).isoformat()
 
             for item in local_templates:
                 tid = item.get("id") or str(uuid4())

@@ -10,6 +10,9 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CAMPAIGN_DB_PATH=/data/pharos.sqlite3
+      # MCP de preparação: único Host liberado pelo transporte. Deixar vazio
+      # desliga o endpoint /mcp sem precisar de mudança de código.
+      - MCP_ALLOWED_HOSTS=pharos-server.yagomaia.com.br
     volumes:
       - pharos_sqlite_data:/data
     depends_on:
