@@ -13,11 +13,14 @@ Regras verificadas:
 
 - nenhuma chamada do protocolo passa sem credencial de preparação (401 no HTTP);
 - revogar a credencial derruba a conexão em uso, sem reabrir nada;
-- Host estranho é recusado (a proteção contra DNS rebinding continua ligada);
+- Host estranho é recusado (a proteção contra DNS rebinding continua ligada) e
+  nenhum `Origin` de browser passa enquanto `MCP_ALLOWED_ORIGINS` estiver vazio;
 - o inventário é o do plano: sem aplicar, sem excluir, sem combate;
 - `campaignId` não é argumento de ferramenta: a campanha vem da credencial;
 - o conteúdo viaja fiel (acentos, CRLF, tab, emoji) e a resposta não repete o doc;
 - leitura devolve janela com truncamento explícito, nunca corte silencioso;
+- revisar rascunho exige reenviar `sourceRefs`: procedência não se perde por omissão;
+- o log de auditoria registra campanha e credencial, nunca a nota nem o token;
 - fonte de outra campanha não é alcançável daqui;
 - nada do que o MCP faz escreve registro oficial da campanha.
 """
@@ -132,7 +135,7 @@ class PreparationMcpTests(unittest.TestCase):
         return {tool.name: tool.description for tool in
                 self._run(self.app, HOST, self.token, lambda session: session.list_tools()).tools}
 
-    def http_probe(self, host=HOST, token=None, app=None, endpoint=ENDPOINT):
+    def http_probe(self, host=HOST, token=None, app=None, endpoint=ENDPOINT, origin=None):
         """`initialize` cru, para olhar status e headers sem o cliente MCP."""
         body = json.dumps(
             {
@@ -149,6 +152,8 @@ class PreparationMcpTests(unittest.TestCase):
         headers = {"content-type": "application/json", "accept": "application/json"}
         if token:
             headers["authorization"] = f"Bearer {token}"
+        if origin:
+            headers["origin"] = origin
 
         async def probe():
             async with _lifespan(app or self.app), httpx2.AsyncClient(
@@ -224,6 +229,18 @@ class PreparationMcpTests(unittest.TestCase):
         """DNS rebinding: com credencial válida, Host estranho ainda não passa."""
         response = self.http_probe(host="evil.example.com", token=self.token)
         self.assertEqual(response.status_code, 421)
+
+    def test_no_browser_origin_passes_until_one_is_configured(self):
+        """Sem `MCP_ALLOWED_ORIGINS` nenhum browser fala daqui: só cliente sem `Origin`.
+
+        O agent do Victor não manda `Origin`; um site na máquina do GM mandaria, e
+        é exatamente aí que a proteção contra CSRF/DNS rebinding precisa aparecer.
+        """
+        for origin in ("http://evil.example.com", f"http://{HOST}"):
+            with self.subTest(origin=origin):
+                response = self.http_probe(token=self.token, origin=origin)
+                self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.http_probe(token=self.token).status_code, 200)
 
     def test_the_endpoint_travels_with_the_host_app(self):
         """Produção é `app.mount` no FastAPI: o lifespan do transporte entra junto."""
@@ -354,6 +371,17 @@ class PreparationMcpTests(unittest.TestCase):
         self.assertEqual(rest["content"], "x" * 300)
         self.assertEqual(rest["nextOffset"], 600)
 
+    def test_reading_past_the_end_reports_the_end_not_an_empty_window(self):
+        """Offset além do documento não pode parecer "documento vazio aqui"."""
+        source_id = self.imported_source_id("x" * 120)
+        past = self.as_json(self.call("read_source", {"sourceId": source_id, "offset": 5_000}))
+        self.assertEqual(past["offset"], 120, "o offset é trazido para o fim do documento")
+        self.assertEqual(past["content"], "")
+        self.assertEqual(past["returnedChars"], 0)
+        self.assertEqual(past["contentChars"], 120)
+        self.assertFalse(past["truncated"])
+        self.assertIsNone(past["nextOffset"])
+
     def test_read_source_without_a_revision_reads_the_current_one(self):
         """O agent aponta para a fonte; o servidor sabe qual é a revisão atual."""
         source_id = self.imported_source_id("primeira versão")
@@ -440,6 +468,7 @@ class PreparationMcpTests(unittest.TestCase):
                     "draftId": created["id"],
                     "expectedRevision": 1,
                     "payload": {"kind": "npc", "name": "Ferrarin", "role": "ferreiro"},
+                    "sourceRefs": [],
                 },
             ).is_error
             is False
@@ -450,6 +479,7 @@ class PreparationMcpTests(unittest.TestCase):
                 "draftId": created["id"],
                 "expectedRevision": 1,
                 "payload": {"kind": "npc", "name": "Ferrarin", "role": "informante"},
+                "sourceRefs": [],
             },
         )
         self.assertTrue(stale.is_error)
@@ -466,6 +496,46 @@ class PreparationMcpTests(unittest.TestCase):
         self.assertTrue(result.is_error)
         self.assertIn("expectedRevision", self.text_of(result))
 
+    def test_revising_a_draft_without_resending_source_refs_is_refused(self):
+        """Procedência é o que a revisão humana confere: omitir não apaga os vínculos."""
+        source_id = self.imported_source_id()
+        created = self.as_json(self.call(
+            "save_preparation_draft",
+            {
+                "payload": {"kind": "npc", "name": "Ferrarin", "role": "ferreiro"},
+                "sourceRefs": [{"sourceId": source_id, "revision": 1}],
+                "uncertainties": ["uma dúvida sobre a nota"],
+            },
+        ))
+        omitted = self.call(
+            "save_preparation_draft",
+            {
+                "draftId": created["id"],
+                "expectedRevision": created["revision"],
+                "payload": {"kind": "npc", "name": "Ferrarin", "role": "informante"},
+            },
+        )
+        self.assertTrue(omitted.is_error, "omitir sourceRefs não pode descartar a procedência")
+        self.assertIn("sourceRefs", self.text_of(omitted))
+
+        still = self.as_json(self.call("read_preparation_draft", {"draftId": created["id"]}))
+        self.assertEqual(still["sourceRefs"], [{"sourceId": source_id, "revision": 1}])
+        self.assertEqual(still["uncertainties"], ["uma dúvida sobre a nota"])
+        self.assertEqual(still["revision"], created["revision"], "a recusa não cria revisão nova")
+        self.assertEqual(still["payload"]["role"], "ferreiro", "a recusa não escreve nada")
+
+        emptied = self.call(
+            "save_preparation_draft",
+            {
+                "draftId": created["id"],
+                "expectedRevision": created["revision"],
+                "payload": {"kind": "npc", "name": "Ferrarin", "role": "informante"},
+                "sourceRefs": [],
+            },
+        )
+        self.assertFalse(emptied.is_error, self.text_of(emptied))
+        self.assertEqual(self.as_json(emptied)["sourceRefs"], [], "limpar exige [] explícito")
+
     def test_read_campaign_context_shows_existing_entities_to_reuse(self):
         npc = self.campaigns.create_npc(self.gm_id, self.campaign_id, "Ferrarin", "ferreiro")
         listed = self.as_json(self.call("read_campaign_context", {"kind": "npcs"}))
@@ -479,6 +549,19 @@ class PreparationMcpTests(unittest.TestCase):
         )
         body = self.text_of(self.call("read_campaign_context", {"kind": "npcs"}))
         self.assertNotIn("secredo do mestre", body)
+
+    # ── auditoria ──────────────────────────────────────────────────────────
+
+    def test_the_audit_log_names_the_campaign_and_the_credential(self):
+        """Sem `campaignId`/`tokenId` no log não há como reconstruir quem mexeu na mesa."""
+        with self.assertLogs("pharos.preparation_mcp", level="INFO") as logged:
+            self.imported_source_id()
+        written = "\n".join(logged.output)
+        self.assertIn('"tool": "import_source"', written)
+        self.assertIn(self.campaign_id, written)
+        self.assertIn(self.token_id, written)
+        self.assertNotIn(self.token, written, "a credencial não vai para o log")
+        self.assertNotIn(NOTE, written, "o conteúdo da nota não vai para o log")
 
     # ── nada disto toca o que os jogadores veem ────────────────────────────
 

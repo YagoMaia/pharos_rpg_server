@@ -62,7 +62,7 @@ class PreparationTools:
     async def connection_status(self, actor: PreparationActor) -> dict[str, Any]:
         """O que esta credencial alcança — sem nunca repetir a credencial."""
         campaign = await self._call(
-            "connection_status", self.campaigns.get_campaign, actor.user_id, actor.campaign_id
+            "connection_status", actor, self.campaigns.get_campaign, actor.user_id, actor.campaign_id
         )
         return {
             "campaign": {
@@ -101,6 +101,7 @@ class PreparationTools:
         """Guarda o texto exatamente como chegou; a resposta não o repete."""
         return await self._call(
             "import_source",
+            actor,
             self.sources.import_source,
             actor.user_id,
             actor.campaign_id,
@@ -122,6 +123,7 @@ class PreparationTools:
     ) -> dict[str, Any]:
         return await self._call(
             "list_sources",
+            actor,
             self.sources.list_sources,
             actor.user_id,
             actor.campaign_id,
@@ -148,14 +150,14 @@ class PreparationTools:
         window = max(1, min(int(max_chars or 1), MAX_READ_WINDOW_CHARS))
         start = max(0, int(offset or 0))
         stored = await self._call(
-            "read_source",
-            self.sources.read_revision,
-            actor.user_id,
-            actor.campaign_id,
-            source_id,
-            revision,
+            "read_source", actor, self.sources.read_revision,
+            actor.user_id, actor.campaign_id, source_id, revision,
         )
         body = stored.pop("content")
+        # passar do fim é trazido para o fim: `offset == contentChars` e janela vazia
+        # dizem "terminou", enquanto `offset` enorme com `truncated: false` leria
+        # "documento vazio aqui" e o agent juraria que a fonte está em branco.
+        start = min(start, len(body))
         chunk = body[start : start + window]
         stored["content"] = chunk
         stored["offset"] = start
@@ -186,7 +188,7 @@ class PreparationTools:
         for name, lister in listers.items():
             if kind != "all" and kind != name:
                 continue
-            rows = await self._call(name, lister, actor.user_id, actor.campaign_id)
+            rows = await self._call(name, actor, lister, actor.user_id, actor.campaign_id)
             counts[name] = len(rows)
             items.extend(self._brief(name, row) for row in rows[:page])
         return {
@@ -233,6 +235,7 @@ class PreparationTools:
         if draft_id is None:
             return await self._call(
                 "save_preparation_draft",
+                actor,
                 self.drafts.create_draft,
                 actor.user_id,
                 actor.campaign_id,
@@ -246,8 +249,17 @@ class PreparationTools:
                 "422: expectedRevision obrigatório para revisar um rascunho. Ler o "
                 "rascunho antes e enviar a revisão que foi vista."
             )
+        if source_refs is None:
+            # `update_draft` substitui os vínculos: sem esta trava o agent conserta
+            # um título e perde a procedência que a revisão humana confere.
+            raise ToolError(
+                "422: sourceRefs obrigatório para revisar um rascunho. Ler o "
+                "rascunho antes e reenviar as fontes citadas; para desvincular, "
+                "enviar sourceRefs com lista vazia."
+            )
         return await self._call(
             "save_preparation_draft",
+            actor,
             self.drafts.update_draft,
             actor.user_id,
             actor.campaign_id,
@@ -263,31 +275,37 @@ class PreparationTools:
         self, actor: PreparationActor, draft_id: str
     ) -> dict[str, Any]:
         return await self._call(
-            "read_preparation_draft",
-            self.drafts.read_draft,
-            actor.user_id,
-            actor.campaign_id,
-            draft_id,
+            "read_preparation_draft", actor, self.drafts.read_draft,
+            actor.user_id, actor.campaign_id, draft_id,
         )
 
     # ── execução ───────────────────────────────────────────────────────────
 
     async def _call(
-        self, tool: str, operation: Callable[..., ResultT], *args: Any, **kwargs: Any
+        self,
+        tool: str,
+        actor: PreparationActor,
+        operation: Callable[..., ResultT],
+        *args: Any,
+        **kwargs: Any,
     ) -> ResultT:
         """Store síncrona fora do event loop, erro de domínio legível para o agent."""
         try:
             outcome = await anyio.to_thread.run_sync(partial(operation, *args, **kwargs))
         except CampaignError as error:
-            self._log(tool, args, outcome=f"{error.status}")
+            self._log(tool, actor, outcome=f"{error.status}")
             raise ToolError(f"{error.status}: {error}") from error
-        self._log(tool, args, outcome=_outcome_of(outcome))
+        self._log(tool, actor, outcome=_outcome_of(outcome))
         return outcome
 
     @staticmethod
-    def _log(tool: str, args: Sequence[Any], outcome: str) -> None:
-        """Sem conteúdo de nota e sem token: só o bastante para auditar a mesa."""
-        actor = args[0] if args else None
+    def _log(tool: str, actor: PreparationActor, outcome: str) -> None:
+        """Sem conteúdo de nota e sem token: só o bastante para auditar a mesa.
+
+        O ator entra como argumento explícito: `args[0]` das stores é o `user_id`
+        (uma string), e ler `campaign_id` dela devolvia `None` — a auditoria ficava
+        Registrada sem dizer em qual mesa nem com qual credencial.
+        """
         logger.info(
             "preparation_mcp %s",
             json.dumps(

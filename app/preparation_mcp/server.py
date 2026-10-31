@@ -204,8 +204,10 @@ def register_tools(mcp: MCPServer, tools: PreparationTools) -> None:
         description=(
             "Cria (sem `draftId`) ou revisa (com `draftId` e `expectedRevision` "
             "lidos antes) uma proposta tipada: session/encounter/npc/quest. A "
-            "proposta cita `(sourceId, revision)` exatos e lista incertezas. Isto "
-            "não aplica nada: um humano revisa e aplica no app do mestre."
+            "proposta cita `(sourceId, revision)` exatos e lista incertezas. Ao "
+            "revisar, `sourceRefs` é obrigatório: o servidor não descarta vínculos "
+            "por omissão — desvincular exige enviar a lista vazia. Isto não aplica "
+            "nada: um humano revisa e aplica no app do mestre."
         ),
     )
     async def save_preparation_draft(
