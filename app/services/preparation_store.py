@@ -354,18 +354,33 @@ class PreparationStore:
         }
 
     def read_revision(
-        self, user_id: str, campaign_id: str, source_id: str, revision: int
+        self,
+        user_id: str,
+        campaign_id: str,
+        source_id: str,
+        revision: int | None = None,
     ) -> dict[str, Any]:
+        """Uma revisão da fonte; sem número, a atual.
+
+        `revision=None` é o que o MCP precisa: o agent aponta para a fonte e o
+        servidor decide qual é a revisão corrente, em vez de o modelo adivinhar.
+        """
         self.campaigns.assert_gm(user_id, campaign_id)
         with closing(self._connect()) as conn:
             row = conn.execute(
                 """SELECT r.*, s.relative_path, s.title FROM preparation_source_revisions r
                 JOIN preparation_sources s ON s.id = r.source_id
-                WHERE r.source_id = ? AND r.revision = ? AND s.campaign_id = ?""",
-                (source_id, int(revision), campaign_id),
+                WHERE r.source_id = ? AND s.campaign_id = ?
+                  AND r.revision = COALESCE(?, s.current_revision)""",
+                (source_id, campaign_id, None if revision is None else int(revision)),
             ).fetchone()
             if not row:
-                raise CampaignError(404, "Revisão da fonte não encontrada.")
+                wanted = "atual" if revision is None else str(int(revision))
+                raise CampaignError(
+                    404,
+                    f"Revisão {wanted} da fonte {source_id} não existe nesta "
+                    "campanha. Listar as fontes para ver o número da revisão.",
+                )
             return {
                 "sourceId": row["source_id"],
                 "revision": row["revision"],

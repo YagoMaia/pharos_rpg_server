@@ -276,6 +276,29 @@ class PreparationSourceTests(unittest.TestCase):
         )
         self.assertEqual(restored["content"], "conteúdo persistente")
 
+    def test_reading_without_a_revision_returns_the_current_one(self):
+        """Sem número, a revisão atual: quem a conhece é o servidor, não o agent."""
+        user_id = self.store.user_for_token(self.gm["Authorization"][7:])["id"]
+        source_id = self.import_source("primeira versão").json()["source"]["id"]
+        self.import_source("segunda versão")
+
+        current = self.preparation.read_revision(user_id, self.campaign_id, source_id)
+        self.assertEqual(current["revision"], 2)
+        self.assertEqual(current["content"], "segunda versão")
+
+        older = self.preparation.read_revision(user_id, self.campaign_id, source_id, 1)
+        self.assertEqual(older["content"], "primeira versão")
+
+    def test_a_revision_that_does_not_exist_names_source_and_number(self):
+        user_id = self.store.user_for_token(self.gm["Authorization"][7:])["id"]
+        source_id = self.import_source("qualquer nota").json()["source"]["id"]
+
+        with self.assertRaises(CampaignError) as failure:
+            self.preparation.read_revision(user_id, self.campaign_id, source_id, 9)
+        self.assertEqual(failure.exception.status, 404)
+        self.assertIn("9", str(failure.exception))
+        self.assertIn(source_id, str(failure.exception))
+
     # ── autorização ────────────────────────────────────────────────────────
 
     def test_player_cannot_import_list_or_read_sources(self):
