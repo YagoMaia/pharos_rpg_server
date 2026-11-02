@@ -27,6 +27,28 @@ def _password_hash(password: str, salt: bytes) -> str:
     return f"{salt.hex()}:{digest.hex()}"
 
 
+def _verify_secret(secret: str, stored: str) -> bool:
+    """Confira um segredo contra o `salt:digest` gravado, em tempo constante.
+
+    Único caminho de comparação para senha e PIN da mesa: a regra de custo é uma só e
+    ninguém esquece o `compare_digest` ao adicionar uma porta de entrada nova.
+    """
+    salt, _ = stored.split(":")
+    return secrets.compare_digest(stored, _password_hash(secret, bytes.fromhex(salt)))
+
+
+def _canonical_table_name(name: str) -> str | None:
+    """Nome da lista fixa que corresponde ao digitado (caixa tolerante), ou None."""
+    return next(
+        (entry for entry in TABLE_NAMES if entry.lower() == name.strip().lower()),
+        None,
+    )
+
+
+MIN_TABLE_PIN_CHARS = 6
+MAX_TABLE_PIN_CHARS = 64
+
+
 TABLE_NAMES = (
     "Gabriel",
     "Leandro",
@@ -49,7 +71,8 @@ class CampaignStore:
                     display_name TEXT NOT NULL, password_hash TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS table_users (
-                    name TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE REFERENCES users(id)
+                    name TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE REFERENCES users(id),
+                    pin_hash TEXT
                 );
                 CREATE TABLE IF NOT EXISTS tokens (
                     hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
@@ -152,6 +175,13 @@ class CampaignStore:
             cols = [row["name"] for row in conn.execute("PRAGMA table_info(members)").fetchall()]
             if "character_data" not in cols:
                 conn.execute("ALTER TABLE members ADD COLUMN character_data TEXT")
+            # Migration do PIN da mesa: base antiga fica com pin_hash NULL, que significa
+            # "identidade ainda não provisionada" — ninguém entra até o mestre definir um.
+            table_cols = [
+                row["name"] for row in conn.execute("PRAGMA table_info(table_users)").fetchall()
+            ]
+            if "pin_hash" not in table_cols:
+                conn.execute("ALTER TABLE table_users ADD COLUMN pin_hash TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         return open_connection(self.path)
@@ -192,41 +222,93 @@ class CampaignStore:
             saved = (
                 user["password_hash"] if user else _password_hash("invalid", bytes(16))
             )
-            salt, _ = saved.split(":")
-            if not user or not secrets.compare_digest(
-                saved, _password_hash(password, bytes.fromhex(salt))
-            ):
+            if not user or not _verify_secret(password, saved):
                 raise CampaignError(401, "Credenciais inválidas.")
             return self._issue_token(conn, user["id"])
 
     def table_login(self, name: str, pin: str) -> str:
-        """Emite token para a lista fixa da mesa; o PIN público evita apenas erros casuais."""
-        canonical = next(
-            (entry for entry in TABLE_NAMES if entry.lower() == name.strip().lower()),
-            None,
-        )
-        if not canonical or not secrets.compare_digest(pin, canonical.lower()):
-            raise CampaignError(401, "Nome ou PIN inválidos.")
+        """Emite token para a lista fixa da mesa mediante PIN com hash.
+
+        Já foi `pin == nome.lower()`, valor que o próprio app exibia como dica — ou
+        seja, não autenticava ninguém. Hoje a identidade precisa de PIN provisionado
+        por `set_table_pin`; `pin_hash IS NULL` quer dizer "ainda não entra", e essa
+        distinção é devolvida de propósito porque os nomes da mesa já são públicos.
+        """
+        canonical = _canonical_table_name(name)
         with closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT user_id FROM table_users WHERE name = ?", (canonical,)
-            ).fetchone()
-            if row:
-                return self._issue_token(conn, row["user_id"])
-            user_id = str(uuid4())
-            salt = secrets.token_bytes(16)
-            conn.execute(
-                "INSERT INTO users VALUES (?, ?, ?, ?)",
-                (
-                    user_id,
-                    f"{user_id}@table.invalid",
-                    canonical,
-                    _password_hash(secrets.token_urlsafe(32), salt),
-                ),
+            row = (
+                conn.execute(
+                    "SELECT user_id, pin_hash FROM table_users WHERE name = ?", (canonical,)
+                ).fetchone()
+                if canonical
+                else None
             )
-            conn.execute("INSERT INTO table_users VALUES (?, ?)", (canonical, user_id))
-            return self._issue_token(conn, user_id)
+            if row and not row["pin_hash"]:
+                raise CampaignError(
+                    401, f"o PIN de {canonical} ainda não definido; peça um PIN ao mestre."
+                )
+            # Nome desconhecido ou sem PIN: mesma rotina de verificação, mesmo custo.
+            saved = row["pin_hash"] if row else _password_hash("invalid", bytes(16))
+            if not row or not _verify_secret(pin, saved):
+                raise CampaignError(401, "Nome ou PIN inválidos.")
+            return self._issue_token(conn, row["user_id"])
+
+    def set_table_pin(self, name: str, pin: str) -> dict:
+        """Define (ou gira) o PIN de uma identidade da mesa. Sem rota pública: só admin local.
+
+        Girar o PIN derruba as sessões daquele usuário — é para isso que se gira um PIN.
+        O PIN legado (o próprio nome) é recusado: ele está em prints de documentação e na
+        dica da tela, então aceitá-lo anularia a mudança.
+        """
+        canonical = _canonical_table_name(name)
+        if not canonical:
+            raise CampaignError(
+                422,
+                f"{name!r} não está na lista da mesa; nomes aceitos: {', '.join(TABLE_NAMES)}.",
+            )
+        secret = pin.strip()
+        if not MIN_TABLE_PIN_CHARS <= len(secret) <= MAX_TABLE_PIN_CHARS:
+            raise CampaignError(
+                422,
+                f"o PIN de {canonical} tem {len(secret)} caractere(s); "
+                f"esperado entre {MIN_TABLE_PIN_CHARS} e {MAX_TABLE_PIN_CHARS}.",
+            )
+        if secret.lower() == canonical.lower():
+            raise CampaignError(
+                422, f"o PIN de {canonical} não pode ser o próprio nome ({canonical.lower()})."
+            )
+        salt = secrets.token_bytes(16)
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            user_id = self._ensure_table_user(conn, canonical)
+            conn.execute(
+                "UPDATE table_users SET pin_hash = ? WHERE name = ?",
+                (_password_hash(secret, salt), canonical),
+            )
+            conn.execute("DELETE FROM tokens WHERE user_id = ?", (user_id,))
+            return {"name": canonical, "pinChars": len(secret), "userId": user_id}
+
+    def _ensure_table_user(self, conn: sqlite3.Connection, canonical: str) -> str:
+        """Linha de `table_users` (e o usuário por trás dela) para a identidade dada."""
+        row = conn.execute(
+            "SELECT user_id FROM table_users WHERE name = ?", (canonical,)
+        ).fetchone()
+        if row:
+            return row["user_id"]
+        user_id = str(uuid4())
+        salt = secrets.token_bytes(16)
+        conn.execute(
+            "INSERT INTO users VALUES (?, ?, ?, ?)",
+            (
+                user_id,
+                f"{user_id}@table.invalid",
+                canonical,
+                _password_hash(secrets.token_urlsafe(32), salt),
+            ),
+        )
+        conn.execute("INSERT INTO table_users VALUES (?, ?, NULL)", (canonical, user_id))
+        return user_id
 
     def user_for_token(self, token: str) -> dict | None:
         with closing(self._connect()) as conn:

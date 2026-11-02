@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from redis import Redis
 from redis.exceptions import RedisError
 from starlette.websockets import WebSocketDisconnect
+from table_access import credentials, provision_all
 
 from app.main import app
 from app.managers.connection import ConnectionManager
@@ -73,6 +74,7 @@ class CampaignLiveRedisTests(unittest.TestCase):
             self.fail(MISSING_REDIS_HINT)
 
         self.store = CampaignStore(Path(self.directory.name) / "campaign.sqlite3")
+        provision_all(self.store)
         self.manager = ConnectionManager()
         self.manager.redis = self.manager.redis.from_url(
             self.redis_url, decode_responses=True
@@ -157,11 +159,11 @@ class CampaignLiveRedisTests(unittest.TestCase):
     def test_gm_player_reconnect_and_logout(self):
         gm = self.post(
             "/auth/table-login",
-            {"name": "Victor", "pin": "victor"},
+            credentials("Victor"),
         )["accessToken"]
         player = self.post(
             "/auth/table-login",
-            {"name": "Gabriel", "pin": "gabriel"},
+            credentials("Gabriel"),
         )["accessToken"]
         campaign = self.post("/campaigns", {"name": "Mesa"}, gm)["id"]
         invite = self.post(f"/campaigns/{campaign}/invites", token=gm)["code"]
@@ -181,7 +183,7 @@ class CampaignLiveRedisTests(unittest.TestCase):
         with self.client.websocket_connect(f"/ws/{room}") as unlinked:
             outsider = self.post(
                 "/auth/table-login",
-                {"name": "Wayne", "pin": "wayne"},
+                credentials("Wayne"),
             )["accessToken"]
             unlinked.send_json(
                 {"type": "AUTH_CAMPAIGN", "payload": {"token": outsider}}

@@ -68,6 +68,32 @@ docker exec pharos-backend rm /data/backup.sqlite3
 O runbook versionado fica em `docs/DEPLOYMENT_DOCKER.md` e `docs/CHECKLIST_DEPLOY.md`
 no repositório do frontend (`pharos_rp`).
 
+## Acesso da mesa (nomes e PINs)
+
+`POST /auth/table-login` autentica pela lista fixa de nomes (`Victor` é o mestre). O PIN
+deixa de ser o próprio nome em minúsculas: ele passa a ficar em `table_users.pin_hash`
+(PBKDF2, mesmo custo da senha de conta) e a identidade sem PIN provisionado **não entra**.
+
+> **Ordem de deploy obrigatória:** assim que o backend novo subir, `pin_hash` está `NULL`
+> para toda a mesa, então **nenhum login novo da mesa funciona** (as sessões já emitidas
+> continuam válidas até expirarem — são 7 dias). Provisione os PINs antes de a mesa
+> precisar entrar de novo.
+
+```bash
+# status (leitura pura)
+sudo docker exec -i pharos-backend python - --list < tools/set_table_pin.py
+# gera e mostra uma única vez
+sudo docker exec -i pharos-backend python - --name Victor --generate < tools/set_table_pin.py
+# ou defina você mesmo, por arquivo (o PIN nunca vai para a linha de comando)
+sudo docker exec -i pharos-backend python - --name Yago --pin-file /tmp/pin.txt < tools/set_table_pin.py
+```
+
+Fora do container: `uv run python tools/set_table_pin.py --db /caminho/pharos.sqlite3 ...`.
+Regras: 6–64 caracteres, e o PIN não pode ser o próprio nome — o valor legado estava na
+dica da tela de login, então aceitá-lo anularia a mudança. Girar um PIN **derruba as
+sessões** daquela identidade. Tokens de sessão já emitidos antes do deploy continuam
+válidos; se houver suspeita de vazamento, gire o PIN.
+
 ## Preparação do mestre (fontes, rascunhos, credenciais)
 
 Fluxo em três camadas, cada uma com sua rota sob `/campaigns/{campaign_id}/preparation`:

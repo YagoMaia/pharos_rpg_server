@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.routers.campaigns import get_campaign_store
 from app.services.campaign_store import CampaignStore
+from table_access import credentials, provision_all
 
 
 class CampaignEncountersAndNpcsTests(unittest.TestCase):
@@ -14,15 +15,16 @@ class CampaignEncountersAndNpcsTests(unittest.TestCase):
         self.tmp = TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "test_encounters_npcs.sqlite3"
         self.store = CampaignStore(self.db_path)
+        provision_all(self.store)
         app.dependency_overrides[get_campaign_store] = lambda: self.store
         self.client = TestClient(app)
 
         # Autentica mestre Victor e jogador Gabriel
-        gm_resp = self.client.post("/auth/table-login", json={"name": "Victor", "pin": "victor"})
+        gm_resp = self.client.post("/auth/table-login", json=credentials("Victor"))
         self.assertEqual(gm_resp.status_code, 200)
         self.gm_token = gm_resp.json()["accessToken"]
 
-        p1_resp = self.client.post("/auth/table-login", json={"name": "Gabriel", "pin": "gabriel"})
+        p1_resp = self.client.post("/auth/table-login", json=credentials("Gabriel"))
         self.assertEqual(p1_resp.status_code, 200)
         self.p1_token = p1_resp.json()["accessToken"]
 
