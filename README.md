@@ -186,3 +186,16 @@ vários harnesses usam timeout de ~30 s por chamada MCP; para nota grande, aumen
 
 Testes do transporte, da credencial e das ferramentas: `tests/test_preparation_mcp.py`
 (cliente MCP oficial sobre o ASGI real, não chamada direta de função).
+
+Smoke de ponta a ponta contra uma instalação real (a sua máquina → túnel → backend):
+
+```powershell
+uv run python tools/preparation_smoke.py            # produção
+uv run python tools/preparation_smoke.py --base http://127.0.0.1:8000 --keep
+```
+
+Ele pede e-mail e senha do mestre no terminal, emite uma credencial de preparação
+numa **campanha de ensaio**, roda o fluxo MCP pelo cliente oficial (importar, reler
+por janelas, rascunho com vínculo, tentativas recusadas de aplicar) e revoga a
+credencial no final. Usar ensaio não é frescura: fonte bruta é imutável e não existe
+exclusão, então nota escrita na campanha real fica lá para sempre.
