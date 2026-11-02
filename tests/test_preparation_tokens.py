@@ -22,6 +22,7 @@ from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -30,6 +31,7 @@ from app.routers.campaigns import get_campaign_store
 from app.routers.preparation import get_preparation_store
 from app.services.campaign_store import CampaignStore
 from app.services.preparation_store import PreparationStore
+from app.services.preparation_tokens import PreparationTokenStore
 
 COLLECTION = "campanha-victor"
 
@@ -261,6 +263,23 @@ class PreparationTokenTests(unittest.TestCase):
                     headers=self.as_token(value),
                 )
                 self.assertEqual(response.status_code, 401, response.text)
+
+    def test_a_bogus_credential_is_a_read_and_never_opens_a_write(self):
+        """Um Bearer inventado não pode reservar o escritor do SQLite.
+
+        `resolve` grava `last_used_at`, então hoje qualquer `pharos_prep_...` vindo
+        da internet abre `BEGIN IMMEDIATE` antes de descobrir que a credencial não
+        existe — e passa a disputar a escrita com as importações do mestre.
+        """
+        tokens = PreparationTokenStore(self.database, self.store)
+        issued = self.issue(label="auditoria").json()
+        with patch("app.services.preparation_tokens.write_transaction") as writes:
+            for value in ("", "pharos_prep_", "pharos_prep_nao-existe", "token-de-sessao"):
+                with self.subTest(value=value):
+                    self.assertIsNone(tokens.resolve(value))
+            self.assertEqual(writes.call_count, 0, "credencial inválida não escreve nada")
+        self.assertIsNotNone(tokens.resolve(issued["token"]), "a válida continua valendo")
+        self.assertTrue(self.list_tokens().json()["items"][0]["lastUsedAt"])
 
 
 if __name__ == "__main__":

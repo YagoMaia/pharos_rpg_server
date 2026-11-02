@@ -14,6 +14,11 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import anyio
+from mcp.server.transport_security import (
+    TransportSecurityMiddleware,
+    TransportSecuritySettings,
+)
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -67,16 +72,34 @@ class PreparationAuthMiddleware:
     Resolver a credencial é SQLite bloqueante, então sai do event loop em
     `anyio.to_thread`. O `resolve` lê `revoked_at` a cada uso de propósito, e é
     isso que faz a revogação valer na hora também para uma sessão MCP aberta.
+
+    A validação de transporte (Host/Origin/Content-Type) do próprio SDK é chamada
+    aqui **antes** da credencial: do contrário um Bearer inventado enviado pela
+    internet já teria aberto transação no banco antes de ser recusado por Host. O
+    app interno do SDK confere de novo — é a mesma regra, duas vezes, de propósito.
     """
 
-    def __init__(self, app: ASGIApp, tokens: ResolvesPreparationTokens):
+    def __init__(
+        self,
+        app: ASGIApp,
+        tokens: ResolvesPreparationTokens,
+        security: TransportSecuritySettings | None = None,
+    ):
         self.app = app
         self.tokens = tokens
+        self.security = TransportSecurityMiddleware(security) if security else None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        if self.security is not None:
+            refused = await self.security.validate_request(
+                Request(scope), is_post=scope.get("method") == "POST"
+            )
+            if refused is not None:
+                await refused(scope, receive, send)
+                return
         actor = await self._actor(bearer_of(scope))
         if actor is None:
             await self._refuse(scope, receive, send)
