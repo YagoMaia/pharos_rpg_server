@@ -83,26 +83,75 @@ class Rest:
             )
 
 
+class SmokeProblem(Exception):
+    """Falha de ambiente ou credencial: a saída diz o que o operador deve fazer."""
+
+
+def require_ok(response, context: str) -> None:
+    """Erro HTTP vira frase útil, não traceback de httpx."""
+    if response.status_code < 400:
+        return
+    if response.status_code in (401, 403):
+        raise SmokeProblem(
+            f"{context}: {response.status_code}. O smoke não cria conta nem redefine "
+            "senha — use a conta do mestre (a mesma do app) ou registre antes."
+        )
+    detail = response.text[:200].replace("\n", " ")
+    raise SmokeProblem(f"{context}: {response.status_code} {detail}")
+
+
 def login(base: str, email: str, password: str) -> str:
     with httpx2.Client(base_url=base, timeout=30.0) as client:
         response = client.post("/auth/login", json={"email": email, "password": password})
-    response.raise_for_status()
+    require_ok(response, f"login de {email}")
     return response.json()["accessToken"]
 
 
+def probe_endpoint(endpoint: str, report: Reporter) -> None:
+    """`initialize` sem credencial antes de gastar token: prova URL, Host e túnel.
+
+    Os códigos dizem exatamente onde a cadeia quebrou: 401 é o esperado, 421 é Host
+    fora de `MCP_ALLOWED_HOSTS`, 404 é endpoint não publicado (hosts vazios no env).
+    """
+    body = {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "smoke", "version": "1"}},
+    }
+    with httpx2.Client(timeout=30.0) as client:
+        response = client.post(endpoint, json=body, headers={
+            "content-type": "application/json", "accept": "application/json",
+        })
+    hints = {
+        421: "Host recusado pelo transporte: confira MCP_ALLOWED_HOSTS / o túnel",
+        404: "endpoint não publicado: MCP_ALLOWED_HOSTS vazio desliga o /mcp",
+        403: "Origin recusado: cliente de navegador não é suportado aqui",
+    }
+    if response.status_code == 401:
+        report.check("endpoint /mcp publicado e exige credencial", True)
+        return
+    raise SmokeProblem(
+        f"{endpoint} respondeu {response.status_code}: "
+        f"{hints.get(response.status_code, response.text[:160])}"
+    )
+
+
 def ensure_campaign(rest: Rest, name: str) -> str:
-    existing = rest.call("GET", "/campaigns").json()
-    found = next((c for c in existing if c["name"] == name), None)
+    listed = rest.call("GET", "/campaigns")
+    require_ok(listed, "listar campanhas")
+    found = next((c for c in listed.json() if c["name"] == name), None)
     if found:
         return found["id"]
-    return rest.call("POST", "/campaigns", {"name": name}).json()["id"]
+    created = rest.call("POST", "/campaigns", {"name": name})
+    require_ok(created, f"criar a campanha de ensaio {name!r}")
+    return created.json()["id"]
 
 
 def issue_prep_token(rest: Rest, campaign_id: str) -> dict[str, Any]:
     response = rest.call(
         "POST", f"/campaigns/{campaign_id}/preparation/tokens", {"label": "smoke automatizado"}
     )
-    response.raise_for_status()
+    require_ok(response, "emitir credencial de preparação")
     return response.json()
 
 
@@ -272,7 +321,7 @@ async def mcp_flow(base: str, endpoint: str, token: str, campaign_id: str, repor
 def check_apply_needs_a_human(rest: Rest, prep: dict[str, Any], campaign_id: str,
                               draft_id: str, report: Reporter) -> None:
     path = f"/campaigns/{campaign_id}/preparation/drafts/{draft_id}/apply"
-    body = {"idempotencyKey": "smoke-apply", "acknowledgePlayerVisibility": True}
+    body = {"idempotencyKey": f"smoke-{draft_id}", "acknowledgePlayerVisibility": True}
     with httpx2.Client(base_url=rest.base, timeout=30.0) as client:
         as_prep = client.post(path, json=body, headers={"Authorization": f"Bearer {prep['token']}"})
         as_gm = client.post(path, json=body, headers={"Authorization": f"Bearer {rest.token}"})
@@ -311,34 +360,43 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def run(args: argparse.Namespace) -> int:
-    report = Reporter()
-    print(f"smoke do MCP de preparação em {args.base}")
-
+async def _steps(args: argparse.Namespace, report: Reporter, endpoint: str) -> int:
+    probe_endpoint(endpoint, report)
     email = input("e-mail do mestre: ").strip()
     password = getpass.getpass("senha (não aparece): ")
-    session_token = login(args.base, email, password)
-    report.check("login do mestre", bool(session_token))
+    rest = Rest(args.base, login(args.base, email, password))
+    report.check("login do mestre", True)
 
-    rest = Rest(args.base, session_token)
     campaign_id = ensure_campaign(rest, args.campaign)
     print(f"campanha de ensaio: {args.campaign} ({campaign_id})")
-
     prep = issue_prep_token(rest, campaign_id)
     print(f"credencial de preparação: {mask(prep['token'])}")
-    endpoint = f"{args.base}/mcp"
 
     try:
         draft_id = await mcp_flow(args.base, endpoint, prep["token"], campaign_id, report)
         check_apply_needs_a_human(rest, prep, campaign_id, draft_id, report)
     finally:
         if args.keep:
-            print("\ncrédencial mantida (--keep); revogue pelo app do mestre depois")
+            print("\ncredencial mantida (--keep); revogue pelo app do mestre depois")
         else:
             rest.call("DELETE", f"/campaigns/{campaign_id}/preparation/tokens/{prep['id']}")
             check_revocation_is_immediate(args.base, endpoint, prep["token"], report)
-
     return report.summary()
+
+
+async def run(args: argparse.Namespace) -> int:
+    """Erro de ambiente sai como frase, não como traceback: quem roda é humano."""
+    report = Reporter()
+    endpoint = f"{args.base}/mcp"
+    print(f"smoke do MCP de preparação em {args.base}")
+    try:
+        return await _steps(args, report, endpoint)
+    except SmokeProblem as problem:
+        print(f"\n{problem}")
+        return 2
+    except httpx2.TransportError as transport:
+        print(f"\nnão consegui falar com {args.base}: {transport}")
+        return 2
 
 
 if __name__ == "__main__":
