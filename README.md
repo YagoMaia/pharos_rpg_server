@@ -191,11 +191,16 @@ Smoke de ponta a ponta contra uma instalação real (a sua máquina → túnel �
 
 ```powershell
 uv run python tools/preparation_smoke.py            # produção
+uv run python tools/preparation_smoke.py --password-file cadastro.json.txt
 uv run python tools/preparation_smoke.py --base http://127.0.0.1:8000 --keep
 ```
 
-Ele pede e-mail e senha do mestre no terminal, emite uma credencial de preparação
-numa **campanha de ensaio**, roda o fluxo MCP pelo cliente oficial (importar, reler
-por janelas, rascunho com vínculo, tentativas recusadas de aplicar) e revoga a
-credencial no final. Usar ensaio não é frescura: fonte bruta é imutável e não existe
-exclusão, então nota escrita na campanha real fica lá para sempre.
+Ele pede e-mail e senha do mestre no terminal (ou lê a senha de `--password-file`),
+emite uma credencial de preparação numa **campanha de ensaio**, roda o fluxo MCP pelo
+cliente oficial (importar, reler por janelas, rascunho com vínculo, tentativas recusadas
+de aplicar) e revoga a credencial no final. Usar ensaio não é frescura: fonte bruta é
+imutável e não existe exclusão, então nota escrita na campanha real fica lá para sempre.
+
+`--password-file` existe porque o cadastro não normaliza senha: cadastrar por
+`curl --data-binary @arquivo` e re-digitar no prompt costuma acabar em 401. Use o mesmo
+arquivo nos dois passos.

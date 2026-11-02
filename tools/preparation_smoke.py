@@ -11,10 +11,14 @@ da mesa fica lá para sempre.
 Uso:
 
     uv run python tools/preparation_smoke.py
+    uv run python tools/preparation_smoke.py --password-file ensaio.json.txt
     uv run python tools/preparation_smoke.py --base http://localhost:8000 --keep
 
-E-mail e senha são pedidos no terminal — nunca por argumento, nunca gravados em
-disco ou impressos na saída. A credencial de preparação aparece mascarada.
+O e-mail é pedido no terminal. A senha vem do terminal (`getpass`) ou de
+`--password-file`, que existe porque cadastrar por `curl --data-binary @arquivo` e
+re-digitar a senha no prompt é uma fonte real de erro: o cadastro não normaliza a
+senha, então um caractere diferente devolve 401 sem dizer o motivo. A senha nunca vai
+para argumento de linha de comando. A credencial de preparação aparece mascarada.
 """
 
 import argparse
@@ -22,6 +26,7 @@ import asyncio
 import getpass
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx2
@@ -94,7 +99,9 @@ def require_ok(response, context: str) -> None:
     if response.status_code in (401, 403):
         raise SmokeProblem(
             f"{context}: {response.status_code}. O smoke não cria conta nem redefine "
-            "senha — use a conta do mestre (a mesma do app) ou registre antes."
+            "senha. Se a conta foi cadastrada por arquivo, use --password-file com o "
+            "mesmo arquivo: o cadastro não normaliza senha, um caractere diferente já "
+            "bastaria para recusar."
         )
     detail = response.text[:200].replace("\n", " ")
     raise SmokeProblem(f"{context}: {response.status_code} {detail}")
@@ -105,6 +112,33 @@ def login(base: str, email: str, password: str) -> str:
         response = client.post("/auth/login", json={"email": email, "password": password})
     require_ok(response, f"login de {email}")
     return response.json()["accessToken"]
+
+
+def read_password(path: str) -> str:
+    """Senha vinda de arquivo, sem o fim de linha; NUNCA por argumento.
+
+    `utf-8-sig` porque um arquivo salvo por editor Windows pode trazer BOM, que
+    entraria na senha e viraria um 401 sem explicação.
+    """
+    try:
+        secret = Path(path).read_text(encoding="utf-8-sig").rstrip("\r\n")
+    except OSError as error:
+        raise SmokeProblem(f"não consegui ler a senha de {path!r}: {error}") from error
+    if not secret:
+        raise SmokeProblem(f"o arquivo {path!r} está vazio.")
+    return secret
+
+
+def ask_password(args: argparse.Namespace) -> str:
+    if args.password_file:
+        return read_password(args.password_file)
+    secret = getpass.getpass("senha (não aparece): ")
+    if not secret:
+        raise SmokeProblem(
+            "nenhuma senha foi lida. O console costuma descartar colagem no modo "
+            "senha; digite ou passe --password-file com o arquivo do cadastro."
+        )
+    return secret
 
 
 def probe_endpoint(endpoint: str, report: Reporter) -> None:
@@ -357,14 +391,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base", default=DEFAULT_BASE, help="URL do servidor")
     parser.add_argument("--campaign", default=ENSAIO, help="campanha de ENSAIO a usar")
     parser.add_argument("--keep", action="store_true", help="não revogar a credencial no fim")
+    parser.add_argument(
+        "--password-file",
+        help="arquivo com a senha do mestre (evita re-digitar e errar um caractere)",
+    )
     return parser.parse_args()
 
 
 async def _steps(args: argparse.Namespace, report: Reporter, endpoint: str) -> int:
     probe_endpoint(endpoint, report)
     email = input("e-mail do mestre: ").strip()
-    password = getpass.getpass("senha (não aparece): ")
-    rest = Rest(args.base, login(args.base, email, password))
+    rest = Rest(args.base, login(args.base, email, ask_password(args)))
     report.check("login do mestre", True)
 
     campaign_id = ensure_campaign(rest, args.campaign)
