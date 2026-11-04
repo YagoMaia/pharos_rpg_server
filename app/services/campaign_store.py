@@ -47,6 +47,7 @@ def _canonical_table_name(name: str) -> str | None:
 
 MIN_TABLE_PIN_CHARS = 6
 MAX_TABLE_PIN_CHARS = 64
+_DUMMY_PIN_HASH = _password_hash("invalid", bytes(16))
 
 
 TABLE_NAMES = (
@@ -235,8 +236,7 @@ class CampaignStore:
         distinção é devolvida de propósito porque os nomes da mesa já são públicos.
         """
         canonical = _canonical_table_name(name)
-        with closing(self._connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with closing(self._connect()) as conn:
             row = (
                 conn.execute(
                     "SELECT user_id, pin_hash FROM table_users WHERE name = ?", (canonical,)
@@ -244,15 +244,28 @@ class CampaignStore:
                 if canonical
                 else None
             )
-            if row and not row["pin_hash"]:
-                raise CampaignError(
-                    401, f"o PIN de {canonical} ainda não definido; peça um PIN ao mestre."
-                )
-            # Nome desconhecido ou sem PIN: mesma rotina de verificação, mesmo custo.
-            saved = row["pin_hash"] if row else _password_hash("invalid", bytes(16))
-            if not row or not _verify_secret(pin, saved):
+        # PBKDF2 fora da transação: tentativas inválidas não seguram o escritor SQLite.
+        saved = row["pin_hash"] if row and row["pin_hash"] else _DUMMY_PIN_HASH
+        verified = _verify_secret(pin, saved)
+        if row and not row["pin_hash"]:
+            raise CampaignError(
+                401, f"o PIN de {canonical} ainda não definido; peça um PIN ao mestre."
+            )
+        if not verified or not row or canonical is None:
+            raise CampaignError(401, "Nome ou PIN inválidos.")
+        return self._issue_table_token(canonical, row)
+
+    def _issue_table_token(self, canonical: str, verified: sqlite3.Row) -> str:
+        """Revalida o snapshot sob lock para uma rotação não ressuscitar uma sessão."""
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT user_id FROM table_users WHERE name = ? AND user_id = ? AND pin_hash = ?",
+                (canonical, verified["user_id"], verified["pin_hash"]),
+            ).fetchone()
+            if not current:
                 raise CampaignError(401, "Nome ou PIN inválidos.")
-            return self._issue_token(conn, row["user_id"])
+            return self._issue_token(conn, current["user_id"])
 
     def set_table_pin(self, name: str, pin: str) -> dict:
         """Define (ou gira) o PIN de uma identidade da mesa. Sem rota pública: só admin local.

@@ -135,16 +135,22 @@ class TablePinTests(unittest.TestCase):
                 """
             )
 
-        CampaignStore(old)  # a abertura aplica a migration
+        migrated_store = CampaignStore(old)  # a abertura aplica a migration
 
         with closing(open_connection(old)) as conn:
             columns = [row["name"] for row in conn.execute("PRAGMA table_info(table_users)")]
             kept = conn.execute("SELECT user_id FROM table_users WHERE name = 'Victor'").fetchone()
         self.assertIn("pin_hash", columns)
         self.assertEqual(kept["user_id"], "u1", "a mesa existente não pode desaparecer")
-        self.assertEqual(self.client.post(
-            "/auth/table-login", json={"name": "Victor", "pin": "victor"}
-        ).status_code, 401)
+        # O cliente precisa usar a base legada migrada, não a base nova do setUp.
+        app.dependency_overrides[get_campaign_store] = lambda: migrated_store
+        self.assertEqual(self.login("Victor", "victor").status_code, 401)
+        migrated_store.set_table_pin("Victor", GM_PIN)
+        response = self.login("Victor", GM_PIN)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            migrated_store.user_for_token(response.json()["accessToken"])["id"], "u1"
+        )
 
 
 if __name__ == "__main__":
