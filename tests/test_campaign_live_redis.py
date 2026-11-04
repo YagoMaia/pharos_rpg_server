@@ -245,3 +245,17 @@ class CampaignLiveRedisTests(unittest.TestCase):
             self.assertEqual(reconnected.receive_json()["type"], "AUTH_OK")
             reconnected.send_json({"type": "GM_CONNECT", "payload": {}})
             self.assertIn("hero", reconnected.receive_json()["combatants"])
+
+    def test_revoked_silent_socket_cannot_receive_the_next_broadcast(self):
+        token = self.store.table_login("Victor", "victor")
+        user_id = self.store.user_for_token(token)["id"]
+        campaign = self.store.create_campaign(user_id, "Mesa privada")["id"]
+        room = f"campaign-{campaign}"
+        with self.client.websocket_connect(f"/ws/{room}") as socket:
+            socket.send_json({"type": "AUTH_CAMPAIGN", "payload": {"token": token}})
+            self.assertEqual(socket.receive_json()["type"], "AUTH_OK")
+            self.store.revoke_token(user_id, token)
+            self.client.portal.call(self.manager.broadcast_event, room, "PRIVATE_EVENT", {})
+            with self.assertRaises(WebSocketDisconnect) as closed:
+                socket.receive_json()
+            self.assertEqual(closed.exception.code, 1008)
