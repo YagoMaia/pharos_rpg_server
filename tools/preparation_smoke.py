@@ -272,7 +272,10 @@ async def mcp_flow(base: str, endpoint: str, token: str, campaign_id: str, repor
 def check_apply_needs_a_human(rest: Rest, prep: dict[str, Any], campaign_id: str,
                               draft_id: str, report: Reporter) -> None:
     path = f"/campaigns/{campaign_id}/preparation/drafts/{draft_id}/apply"
-    body = {"idempotencyKey": "smoke-apply", "acknowledgePlayerVisibility": True}
+    draft = rest.call("GET", f"/campaigns/{campaign_id}/preparation/drafts/{draft_id}")
+    draft.raise_for_status()
+    body = {"idempotencyKey": "smoke-apply", "acknowledgePlayerVisibility": True,
+            "expectedRevision": draft.json()["revision"]}
     with httpx2.Client(base_url=rest.base, timeout=30.0) as client:
         as_prep = client.post(path, json=body, headers={"Authorization": f"Bearer {prep['token']}"})
         as_gm = client.post(path, json=body, headers={"Authorization": f"Bearer {rest.token}"})

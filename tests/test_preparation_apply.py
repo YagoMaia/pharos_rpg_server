@@ -14,9 +14,11 @@ combate"*. Regras verificadas aqui:
 """
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier
 from unittest.mock import patch
 
 from combat_guard import no_combat_transport
@@ -117,7 +119,8 @@ class PreparationApplyTests(unittest.TestCase):
 
     def apply(self, draft_id, **body):
         return self.client.post(
-            self.draft_path(draft_id, "/apply"), headers=self.gm, json=body
+            self.draft_path(draft_id, "/apply"), headers=self.gm,
+            json={"expectedRevision": 1, **body},
         )
 
     def official_counts(self):
@@ -137,6 +140,81 @@ class PreparationApplyTests(unittest.TestCase):
         return dict(row)
 
     # ── criar destino oficial a partir do rascunho ─────────────────────────
+
+    def test_apply_requires_explicit_reviewed_revision(self):
+        draft = self.create_draft(NPC_PAYLOAD).json()
+        response = self.client.post(self.draft_path(draft["id"], "/apply"), headers=self.gm, json={})
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.official_counts()["campaign_npcs"], 0)
+
+    def test_apply_rejects_invalid_reviewed_revision(self):
+        draft = self.create_draft(NPC_PAYLOAD).json()
+        for revision in (0, -1, True, "1", None):
+            with self.subTest(revision=revision):
+                response = self.apply(draft["id"], expectedRevision=revision)
+                self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.official_counts()["campaign_npcs"], 0)
+
+    def test_apply_rejects_outdated_revision_without_writing(self):
+        draft = self.create_draft(NPC_PAYLOAD).json()
+        changed = self.client.put(
+            self.draft_path(draft["id"]), headers=self.gm,
+            json={"payload": {**NPC_PAYLOAD, "role": "espião"}, "expectedRevision": draft["revision"]},
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        response = self.apply(draft["id"], expectedRevision=draft["revision"])
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.official_counts()["campaign_npcs"], 0)
+        self.assertIsNone(self.client.get(self.draft_path(draft["id"]), headers=self.gm).json()["application"])
+
+    def test_same_key_with_a_different_reviewed_revision_is_not_a_replay(self):
+        draft = self.create_draft(NPC_PAYLOAD).json()
+        first = self.apply(draft["id"], expectedRevision=1, idempotencyKey="review-key")
+        self.assertEqual(first.status_code, 201, first.text)
+        mismatch = self.apply(draft["id"], expectedRevision=2, idempotencyKey="review-key")
+        self.assertEqual(mismatch.status_code, 409, mismatch.text)
+        self.assertEqual(self.official_counts()["campaign_npcs"], 1)
+
+    def test_simultaneous_apply_with_same_key_returns_one_result(self):
+        draft = self.create_draft(NPC_PAYLOAD).json()
+        barrier = Barrier(2)
+
+        def request_apply(_index):
+            barrier.wait(timeout=5)
+            return self.apply(draft["id"], expectedRevision=1, idempotencyKey="concurrent-key")
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            responses = list(workers.map(request_apply, range(2)))
+        self.assertEqual([response.status_code for response in responses], [201, 201])
+        self.assertEqual(responses[0].json(), responses[1].json())
+        self.assertEqual(self.official_counts()["campaign_npcs"], 1)
+
+    def test_concurrent_edit_and_apply_never_publish_unreviewed_content(self):
+        draft = self.create_draft(NPC_PAYLOAD).json()
+        barrier = Barrier(2)
+
+        def edit():
+            barrier.wait(timeout=5)
+            return self.client.put(
+                self.draft_path(draft["id"]), headers=self.gm,
+                json={"payload": {**NPC_PAYLOAD, "role": "alterado"}, "expectedRevision": 1},
+            )
+
+        def apply():
+            barrier.wait(timeout=5)
+            return self.apply(draft["id"], expectedRevision=1, idempotencyKey="edit-race")
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            edit_future = workers.submit(edit)
+            apply_future = workers.submit(apply)
+            edit_response, apply_response = edit_future.result(), apply_future.result()
+        self.assertIn((edit_response.status_code, apply_response.status_code), ((200, 409), (409, 201)))
+        if apply_response.status_code == 201:
+            npc = self.official_row("campaign_npcs", apply_response.json()["recordId"])
+            self.assertEqual(npc["role"], "ferreiro")
+            self.assertEqual(apply_response.json()["draftRevision"], 1)
+        else:
+            self.assertEqual(self.official_counts()["campaign_npcs"], 0)
 
     def test_apply_creates_the_official_record_and_keeps_the_source_binding(self):
         source = self.import_source("o ferreiro traiu a irmandade")
@@ -304,7 +382,7 @@ class PreparationApplyTests(unittest.TestCase):
         response = self.client.post(
             self.draft_path(draft["id"], "/apply"),
             headers=player,
-            json={"idempotencyKey": "ap-player"},
+            json={"idempotencyKey": "ap-player", "expectedRevision": 1},
         )
         self.assertEqual(response.status_code, 403, response.text)
         self.assertEqual(self.official_counts()["campaign_npcs"], 0)
@@ -317,7 +395,7 @@ class PreparationApplyTests(unittest.TestCase):
         response = self.client.post(
             f"/campaigns/{other}/preparation/drafts/{draft['id']}/apply",
             headers=self.gm,
-            json={"idempotencyKey": "ap-other"},
+            json={"idempotencyKey": "ap-other", "expectedRevision": 1},
         )
         self.assertEqual(response.status_code, 404, response.text)
         self.assertEqual(self.official_counts()["campaign_npcs"], 0)
