@@ -93,6 +93,7 @@ class Spell(BaseModel):
 
     isHealing: bool = False
     healFormula: Optional[str] = None
+    requiredRace: str | None = None
 
 
 class DeathSaves(BaseModel):
@@ -143,6 +144,7 @@ class Combatant(BaseModel):
     feats: List[CombatFeat] = Field(default_factory=list)
     factionFeat: Optional[CombatFeat] = None
     specialFeat: Optional[CombatFeat] = None
+    specialization: dict[str, Any] | None = None
 
     initiative: int
     hp: StatsPair

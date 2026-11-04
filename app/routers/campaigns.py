@@ -399,10 +399,11 @@ async def launch_encounter(
         count = max(1, int(m.get("count", 1)))
         hp_val = int(m.get("hp", 10))
         ac_val = int(m.get("ac", 10))
-        init_bonus = int(
-            m.get("initiativeBonus")
-            or m.get("attributes", {}).get("Destreza", {}).get("modifier", 0)
-        )
+        initiative_bonus = m.get("initiativeBonus")
+        if initiative_bonus is None:
+            initiative_bonus = m.get("attributes", {}).get("Destreza", {}).get("modifier", 0)
+        init_bonus = int(initiative_bonus)
+        snapshot = m.get("bestiarySnapshot") or {}
 
         for i in range(count):
             combatant_name = f"{name} #{i + 1}" if count > 1 else name
@@ -439,17 +440,28 @@ async def launch_encounter(
             combatant = Combatant(
                 id=combatant_id,
                 name=combatant_name,
+                baseName=name if snapshot else None,
+                image=snapshot.get("image"),
                 type="npc",
                 armorClass=ac_val,
                 baseArmorClass=ac_val,
                 initiative=init_roll,
                 hp={"current": hp_val, "max": hp_val},
-                focus={"current": 0, "max": 0},
+                focus={"current": snapshot.get("maxFocus", 0), "max": snapshot.get("maxFocus", 0)},
                 turnActions={"standard": True, "bonus": True, "reaction": True},
                 weapons=weapons_dict,
                 attributes=m.get("attributes", {}),
                 skills=m.get("skills", []),
                 stances=m.get("stances", []),
+                spells=snapshot.get("spells") or [],
+                feats=snapshot.get("feats") or [],
+                factionFeat=snapshot.get("factionFeat"),
+                specialFeat=snapshot.get("specialFeat"),
+                specialization=snapshot.get("specialization"),
+                phases=snapshot.get("phases") or [],
+                speed=snapshot.get("speed"),
+                equipment=snapshot.get("equipment"),
+                actions=snapshot.get("actions"),
             )
             state.combatants[combatant_id] = combatant
             state.turn_order.append(combatant_id)
