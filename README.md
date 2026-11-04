@@ -82,6 +82,14 @@ Nenhuma dessas rotas inicia combate nem escreve em `journal_entries`. Aplicar um
 rascunho cujo conteúdo chega aos jogadores (resumo de sessão, NPC/missão com
 `visibility=party`) exige `acknowledgePlayerVisibility: true` no pedido.
 
+Aplicar também exige `expectedRevision` com a revisão exata lida pelo mestre:
+`{"expectedRevision": 1, "idempotencyKey": "aplicacao-1"}`. Se o agente ou outra
+pessoa editar o rascunho depois da leitura, a API devolve `409` e não grava o destino;
+o mestre precisa reler antes de decidir. Uma repetição com a mesma chave e revisão
+retorna o resultado anterior, sem reaplicar. A mesma chave com outra revisão é `409`.
+**Mudança de contrato:** clientes antigos que não enviarem `expectedRevision` receberão
+`422` e precisarão ser atualizados antes do deploy; o smoke deste repositório já envia.
+
 Importar é idempotente por `idempotencyKey`, e a chave representa **um** pedido
 (coleção + caminho + conteúdo): repetir o mesmo pedido devolve exatamente o
 resultado anterior; reutilizar a chave para outra fonte devolve 409. Para

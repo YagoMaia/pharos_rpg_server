@@ -25,11 +25,10 @@ Autorização vem de `CampaignStore.assert_gm`, antes de qualquer leitura.
 import json
 import sqlite3
 from collections.abc import Callable
-from contextlib import closing
 from functools import lru_cache
 from typing import Any
 
-from app.core.database import open_connection
+from app.core.database import write_transaction
 from app.services import campaign_records
 from app.services.campaign_store import CampaignError, CampaignStore
 from app.services.preparation_applications import (
@@ -101,15 +100,13 @@ class PreparationApplyStore:
         self.campaigns = campaigns
         self.drafts = drafts
 
-    def _connect(self) -> sqlite3.Connection:
-        return open_connection(self.path)
-
     def apply(
         self,
         user_id: str,
         campaign_id: str,
         draft_id: str,
         *,
+        expected_revision: int,
         idempotency_key: str | None = None,
         acknowledge_player_visibility: bool = False,
         via_preparation_token: bool = False,
@@ -128,9 +125,11 @@ class PreparationApplyStore:
                 "credencial de preparação do agent cria e propõe, não publica.",
             )
         self.campaigns.assert_gm(user_id, campaign_id)
-        with closing(self._connect()) as conn, conn:
+        # Reservar o escritor antes da leitura impede uma edição concorrente entre
+        # a revisão conferida e a escrita dos registros oficiais.
+        with write_transaction(self.path) as conn:
             draft = self.drafts.draft_row(conn, campaign_id, draft_id)
-            replayed = self._replay(conn, campaign_id, draft_id, idempotency_key)
+            replayed = self._replay(conn, campaign_id, draft_id, idempotency_key, expected_revision)
             if replayed is not None:
                 return replayed
             if latest_application(conn, draft_id):
@@ -138,6 +137,12 @@ class PreparationApplyStore:
                     409,
                     "este rascunho já foi aplicado. Repetir sem a idempotencyKey "
                     "da aplicação criaria um segundo registro.",
+                )
+            if draft["revision"] != expected_revision:
+                raise CampaignError(
+                    409,
+                    f"rascunho mudou: revisão esperada {expected_revision}, "
+                    f"atual {draft['revision']}. Releia antes de aplicar.",
                 )
             payload = parse_payload(json.loads(draft["payload"]))
             self._require_visibility_ack(payload, acknowledge_player_visibility)
@@ -155,6 +160,7 @@ class PreparationApplyStore:
         campaign_id: str,
         draft_id: str,
         idempotency_key: str | None,
+        expected_revision: int,
     ) -> dict[str, Any] | None:
         """Resultado já produzido por esta chave, se houver."""
         if not idempotency_key:
@@ -167,6 +173,12 @@ class PreparationApplyStore:
                 409,
                 f"a idempotencyKey {idempotency_key} já aplicou o rascunho "
                 f"{application['draftId']}. Reaplicar aqui exige outra chave.",
+            )
+        if application["draftRevision"] != expected_revision:
+            raise CampaignError(
+                409,
+                f"a idempotencyKey {idempotency_key} já aplicou a revisão "
+                f"{application['draftRevision']}, não a revisão {expected_revision}.",
             )
         result = stored_result(conn, application["applicationId"])
         if result is None:  # a linha veio do mesmo registro: inatingível na prática

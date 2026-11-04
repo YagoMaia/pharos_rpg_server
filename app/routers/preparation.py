@@ -178,6 +178,7 @@ class ApplyBody(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    expectedRevision: int = Field(strict=True, ge=1, le=MAX_SQLITE_INTEGER)
     idempotencyKey: str | None = Field(
         default=None, min_length=1, max_length=MAX_IDEMPOTENCY_KEY_CHARS
     )
@@ -259,6 +260,7 @@ def apply_draft(campaign_id: str, draft_id: str, body: ApplyBody, actor: Actor, 
         actor["id"],
         campaign_id,
         draft_id,
+        expected_revision=body.expectedRevision,
         idempotency_key=body.idempotencyKey,
         acknowledge_player_visibility=body.acknowledgePlayerVisibility,
         # o agent pode preparar tudo; aplicar exige o mestre logado no app

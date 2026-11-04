@@ -216,7 +216,7 @@ class PreparationTokenTests(unittest.TestCase):
         refused = self.client.post(
             f"/campaigns/{self.campaign_id}/preparation/drafts/{draft.json()['id']}/apply",
             headers=self.as_token(token),
-            json={"idempotencyKey": "agent-tenta"},
+            json={"idempotencyKey": "agent-tenta", "expectedRevision": draft.json()["revision"]},
         )
         self.assertEqual(refused.status_code, 403, refused.text)
         self.assertIn("humana", refused.text.lower())
