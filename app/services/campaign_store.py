@@ -79,6 +79,13 @@ class CampaignStore:
                     hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
                     expires_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS table_login_attempts (
+                    bucket TEXT PRIMARY KEY,
+                    attempts INTEGER NOT NULL CHECK (attempts > 0),
+                    expires_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS table_login_attempts_expiry
+                    ON table_login_attempts(expires_at);
                 CREATE TABLE IF NOT EXISTS campaigns (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, gm_id TEXT NOT NULL REFERENCES users(id)
                 );

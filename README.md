@@ -100,6 +100,26 @@ Logout, expiração, troca de PIN ou mudança do vínculo fecham a conexão com 
 do cliente. Credenciais de preparação são independentes e devem ser revogadas
 separadamente se também houver suspeita de vazamento.
 
+`POST /auth/table-login` admite 10 tentativas por nome e 30 por origem em uma janela
+de 60 segundos (incluindo logins bem-sucedidos). Nome é normalizado como no login;
+trocar caixa ou espaços não renova a cota. O excesso devolve `429` com `Retry-After`
+em segundos, antes de calcular o PIN. Os contadores ficam em `table_login_attempts`
+no mesmo SQLite, são compartilhados entre workers e expiram automaticamente.
+O banco armazena somente chaves derivadas, contagem e expiração, nunca o PIN.
+
+A origem vem de `Request.client`, não de cabeçalhos encaminhados lidos pela rota.
+Atrás de proxy/túnel, configure endereços de proxy confiáveis no servidor ASGI; sem
+isso os clientes podem compartilhar a cota do proxy. Não libere confiança em
+cabeçalhos de qualquer origem. A cota por nome também limita tentativas vindas de
+origens diferentes; um atacante pode esgotá-la e bloquear esse nome até a janela
+expirar. Isso reduz força bruta, mas não substitui proteção de tráfego no proxy.
+
+A tabela de cotas é criada de forma aditiva ao abrir o store. Antes de publicar,
+faça backup consistente do SQLite pelo procedimento acima e valide a configuração
+do proxy. Reverter para a versão com PINs fortes anterior a estas correções não
+exige apagar a tabela nova; sessões já revogadas não voltam. Não reverta para a
+versão que aceita o nome como PIN. Esta etapa não publica nem aplica rascunhos.
+
 ## Preparação do mestre (fontes, rascunhos, credenciais)
 
 Fluxo em três camadas, cada uma com sua rota sob `/campaigns/{campaign_id}/preparation`:
