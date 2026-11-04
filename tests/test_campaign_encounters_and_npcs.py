@@ -5,6 +5,7 @@ import unittest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.models.domain import Combatant
 from app.routers.campaigns import get_campaign_store
 from app.services.campaign_store import CampaignStore
 
@@ -190,6 +191,63 @@ class CampaignEncountersAndNpcsTests(unittest.TestCase):
             # Checa ordenação de iniciativa decrescente
             initiatives = [combat_state.combatants[cid].initiative for cid in combat_state.turn_order]
             self.assertEqual(initiatives, sorted(initiatives, reverse=True))
+
+    def test_launch_bestiary_snapshot_preserves_combat_fields_and_zero_initiative(self):
+        from unittest.mock import AsyncMock, patch
+
+        weapon = {"name": "Garra", "damage": "1d8", "attribute": "Força", "attackBonus": 3, "range": "1.5m"}
+        feat = {"id": "feat-1", "name": "Vigor", "category": "Geral", "benefit": "Forte"}
+        snapshot = {
+            "id": "npc-1", "name": "Quimera", "image": "avatar", "maxFocus": 9,
+            "speed": "9m", "equipment": "armadura", "actions": "rosnar",
+            "feats": [feat], "factionFeat": feat, "specialFeat": feat,
+            "specialization": {"id": "spec-1", "name": "Guardião"},
+            "spells": [{"id": "spell-1", "name": "Chama", "requiredRace": "Elfo"}],
+            "phases": [{"name": "Fúria", "maxHp": 20, "weapons": {"melee": weapon}}],
+        }
+        monster = {
+            "name": "Quimera", "count": 2, "hp": 35, "ac": 17, "initiativeBonus": 0,
+            "attributes": {"Destreza": {"name": "Destreza", "value": 16, "modifier": 3}},
+            "weapons": {"melee": weapon}, "skills": [], "stances": [], "bestiarySnapshot": snapshot,
+        }
+        created = self.client.post(
+            f"/campaigns/{self.campaign_id}/encounters", headers={"Authorization": f"Bearer {self.gm_token}"},
+            json={"name": "Quimeras", "monstersData": [monster]},
+        )
+        self.assertEqual(created.status_code, 201)
+        encounter_id = created.json()["id"]
+        with patch("app.routers.campaigns.manager") as manager, patch("app.routers.campaigns.random.randint", return_value=10):
+            manager.get_state = AsyncMock(return_value=None)
+            manager.broadcast_state = AsyncMock()
+            launched = self.client.post(
+                f"/campaigns/{self.campaign_id}/encounters/{encounter_id}/launch",
+                headers={"Authorization": f"Bearer {self.gm_token}"},
+            )
+            self.assertEqual(launched.status_code, 200)
+            state = manager.broadcast_state.call_args.args[1]
+        self.assertEqual(len(state.combatants), 2)
+        for actor in state.combatants.values():
+            self.assertEqual(actor.initiative, 10)
+            self.assertEqual(actor.armorClass, 17)
+            self.assertEqual(actor.focus.max, 9)
+            self.assertEqual(actor.baseName, "Quimera")
+            self.assertEqual(actor.image, "avatar")
+            self.assertEqual(actor.feats[0].id, "feat-1")
+            self.assertEqual(actor.factionFeat.id, "feat-1")
+            self.assertEqual(actor.specialFeat.id, "feat-1")
+            self.assertEqual(actor.specialization["id"], "spec-1")
+            self.assertEqual(actor.spells[0].id, "spell-1")
+            self.assertEqual(actor.spells[0].requiredRace, "Elfo")
+            self.assertEqual(actor.phases[0].name, "Fúria")
+            self.assertEqual(actor.weapons["melee"].name, "Garra")
+            self.assertEqual(actor.equipment, "armadura")
+            self.assertEqual(actor.actions, "rosnar")
+            self.assertEqual(actor.speed, "9m")
+            restored = Combatant.model_validate(actor.model_dump())
+            self.assertEqual(restored.specialization["id"], "spec-1")
+            self.assertEqual(restored.phases[0].weapons["melee"].name, "Garra")
+            self.assertEqual(restored.spells[0].requiredRace, "Elfo")
+        self.assertEqual(created.json()["monstersData"][0]["bestiarySnapshot"], snapshot)
 
     def test_npc_dossier_permissions_and_visibility(self):
         # 1. Jogador não pode criar NPC
