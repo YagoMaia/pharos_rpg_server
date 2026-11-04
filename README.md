@@ -94,6 +94,12 @@ dica da tela de login, então aceitá-lo anularia a mudança. Girar um PIN **der
 sessões** daquela identidade. Tokens de sessão já emitidos antes do deploy continuam
 válidos; se houver suspeita de vazamento, gire o PIN.
 
+WebSockets de campanha revalidam a sessão antes de cada comando e de cada broadcast.
+Logout, expiração, troca de PIN ou mudança do vínculo fecham a conexão com código
+`1008`. Sem tráfego, a rechecagem ocorre a cada segundo, sem depender de heartbeat
+do cliente. Credenciais de preparação são independentes e devem ser revogadas
+separadamente se também houver suspeita de vazamento.
+
 ## Preparação do mestre (fontes, rascunhos, credenciais)
 
 Fluxo em três camadas, cada uma com sua rota sob `/campaigns/{campaign_id}/preparation`:
