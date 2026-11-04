@@ -9,12 +9,14 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.routers.campaigns import get_campaign_store
 from app.services.campaign_store import CampaignStore
+from table_access import credentials, provision_all
 
 
 class CampaignApiTests(unittest.TestCase):
     def setUp(self):
         self.directory = TemporaryDirectory()
         self.store = CampaignStore(Path(self.directory.name) / "test.sqlite3")
+        provision_all(self.store)
         app.dependency_overrides[get_campaign_store] = lambda: self.store
         self.client = TestClient(app)
 
@@ -247,9 +249,7 @@ class CampaignApiTests(unittest.TestCase):
             "Visitante",
         )
         for name in roster:
-            response = self.client.post(
-                "/auth/table-login", json={"name": name, "pin": name.lower()}
-            )
+            response = self.client.post("/auth/table-login", json=credentials(name))
             self.assertEqual(response.status_code, 200, name)
             token = response.json()["accessToken"]
             self.assertEqual(self.store.user_for_token(token)["display_name"], name)
@@ -258,6 +258,15 @@ class CampaignApiTests(unittest.TestCase):
                     "/campaigns", headers={"Authorization": f"Bearer {token}"}
                 ).json(),
                 [],
+            )
+        for name in roster:
+            # regressão: o PIN que a tela de login exibia como dica não autentica
+            self.assertEqual(
+                self.client.post(
+                    "/auth/table-login", json={"name": name, "pin": name.lower()}
+                ).status_code,
+                401,
+                name,
             )
         for name, pin in (
             ("Victor", "wrong"),
@@ -272,11 +281,11 @@ class CampaignApiTests(unittest.TestCase):
             )
 
         victor = self.client.post(
-            "/auth/table-login", json={"name": "Victor", "pin": "victor"}
+            "/auth/table-login", json=credentials("Victor")
         ).json()["accessToken"]
         campaign_id = self.campaign({"Authorization": f"Bearer {victor}"})["id"]
         returning = self.client.post(
-            "/auth/table-login", json={"name": "Victor", "pin": "victor"}
+            "/auth/table-login", json=credentials("Victor")
         ).json()["accessToken"]
         self.assertEqual(
             self.client.get(
@@ -288,7 +297,7 @@ class CampaignApiTests(unittest.TestCase):
     def test_table_accounts_do_not_reuse_existing_email_accounts(self):
         old_account = self.register("old@example.com", "Victor")
         table_token = self.client.post(
-            "/auth/table-login", json={"name": "Victor", "pin": "victor"}
+            "/auth/table-login", json=credentials("Victor")
         ).json()["accessToken"]
         self.assertNotEqual(
             self.store.user_for_token(old_account["Authorization"].split()[1])["id"],
@@ -297,7 +306,7 @@ class CampaignApiTests(unittest.TestCase):
 
     def test_only_victor_can_create_campaign_in_table_mode(self):
         player_token = self.client.post(
-            "/auth/table-login", json={"name": "Gabriel", "pin": "gabriel"}
+            "/auth/table-login", json=credentials("Gabriel")
         ).json()["accessToken"]
         response = self.client.post(
             "/campaigns",

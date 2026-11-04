@@ -3,14 +3,15 @@ from functools import lru_cache
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.core.config import settings
 from app.managers.connection import manager
-from app.models.domain import CombatSession, Combatant
+from app.models.domain import Combatant, CombatSession
 from app.services.campaign_store import CampaignStore
+from app.services.table_login_throttle import TableLoginThrottle, TableLoginThrottled
 
 router = APIRouter()
 bearer = HTTPBearer(auto_error=False)
@@ -141,6 +142,11 @@ Store = Annotated[CampaignStore, Depends(get_campaign_store)]
 User = Annotated[dict, Depends(current_user)]
 
 
+def get_table_login_throttle(store: Store) -> TableLoginThrottle:
+    """Usa o mesmo SQLite da campanha; as cotas sobrevivem a reinícios de workers."""
+    return TableLoginThrottle(store.path)
+
+
 @router.post("/auth/register", status_code=201)
 def register(body: RegisterBody, store: Store):
     return {"accessToken": store.register(body.email, body.displayName, body.password)}
@@ -152,7 +158,19 @@ def login(body: LoginBody, store: Store):
 
 
 @router.post("/auth/table-login")
-def table_login(body: TableLoginBody, store: Store):
+def table_login(
+    body: TableLoginBody, store: Store, request: Request,
+    throttle: Annotated[TableLoginThrottle, Depends(get_table_login_throttle)],
+):
+    # Não confiar diretamente em X-Forwarded-For/CF-Connecting-IP do pedido.
+    peer = request.client.host if request.client else "unknown"
+    try:
+        throttle.consume(body.name, peer)
+    except TableLoginThrottled as denied:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS, str(denied),
+            headers={"Retry-After": str(denied.retry_after)},
+        ) from denied
     return {"accessToken": store.table_login(body.name, body.pin)}
 
 

@@ -9,11 +9,16 @@ from app.managers.connection import manager
 from app.routers.campaigns import get_campaign_store
 from app.services.campaign_store import CampaignError
 from app.services.engine import GameLogic
+from app.services.socket_authorization import (
+    CampaignSocketAuthorization,
+    close_revoked_socket,
+)
 
 router = APIRouter()
 game_logic = GameLogic(manager)
 
 _MAX_MESSAGES_PER_SECOND = 10
+_AUTH_RECHECK_SECONDS = 1.0
 
 
 async def authenticate_campaign(websocket: WebSocket, campaign_id: str):
@@ -36,9 +41,32 @@ async def authenticate_campaign(websocket: WebSocket, campaign_id: str):
     identity = {"authenticated": True, "role": member["role"],
                 "client_id": f"user:{member['user_id']}", "player_id": None,
                 "character_id": member["character_id"]}
-    await manager.connect(f"campaign-{campaign_id}", websocket, already_accepted=True)
+    authorization = CampaignSocketAuthorization(
+        store, token, campaign_id, member["role"], member["character_id"]
+    )
+    await manager.connect(
+        f"campaign-{campaign_id}", websocket, already_accepted=True,
+        authorization=authorization,
+    )
     await websocket.send_json({"type": "AUTH_OK", "role": member["role"]})
-    return identity, token, store
+    return identity, authorization
+
+
+async def receive_authorized_text(
+    websocket: WebSocket, authorization: CampaignSocketAuthorization,
+) -> str | None:
+    """Revalida a cada comando e, no máximo, a cada segundo sem tráfego de entrada."""
+    while True:
+        text = None
+        try:
+            text = await asyncio.wait_for(websocket.receive_text(), _AUTH_RECHECK_SECONDS)
+        except TimeoutError:
+            pass
+        if not await asyncio.to_thread(authorization):
+            await close_revoked_socket(websocket)
+            return None
+        if text is not None:
+            return text
 
 @router.websocket('/ws/{session_id}')
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
@@ -55,7 +83,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     handshake = await authenticate_campaign(websocket, campaign_id)
     if handshake is None:
         return
-    identity, token, store = handshake
+    identity, authorization = handshake
 
     # Estado de rate limiting por conexao (sliding window)
     msg_count = 0
@@ -63,13 +91,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
     try:
         while True:
-            data_text = await websocket.receive_text()
-            try:
-                member = store.combat_member(token, campaign_id)
-                if member["role"] != identity["role"] or member["character_id"] != identity["character_id"]:
-                    raise CampaignError(403, "Vínculo alterado.")
-            except CampaignError:
-                await websocket.close(code=1008)
+            data_text = await receive_authorized_text(websocket, authorization)
+            if data_text is None:
                 return
 
             # Rate limiting: reinicia janela a cada 1 segundo
@@ -105,4 +128,4 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     except WebSocketDisconnect:
         pass
     finally:
-        manager.disconnect(session_id, websocket)
+        manager.disconnect(room, websocket)

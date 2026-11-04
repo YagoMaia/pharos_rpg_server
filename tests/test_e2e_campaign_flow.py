@@ -16,6 +16,7 @@ from app.models.domain import CombatSession
 from app.routers.campaigns import get_campaign_store
 from app.services.campaign_store import CampaignStore
 from app.services.engine import GameLogic
+from table_access import credentials, provision_all
 
 
 class MemoryManager:
@@ -43,6 +44,7 @@ class EndToEndCampaignFlowTests(unittest.IsolatedAsyncioTestCase):
         self.directory = TemporaryDirectory()
         self.db_path = Path(self.directory.name) / "e2e_pharos.sqlite3"
         self.store = CampaignStore(self.db_path)
+        provision_all(self.store)
         app.dependency_overrides[get_campaign_store] = lambda: self.store
         self.client = TestClient(app)
 
@@ -54,14 +56,14 @@ class EndToEndCampaignFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_full_table_campaign_and_combat_lifecycle(self):
         # 1. Login da mesa: Mestre Victor e Jogador Gabriel
         victor_auth = self.client.post(
-            "/auth/table-login", json={"name": "Victor", "pin": "victor"}
+            "/auth/table-login", json=credentials("Victor")
         )
         self.assertEqual(victor_auth.status_code, 200)
         victor_token = victor_auth.json()["accessToken"]
         victor_headers = {"Authorization": f"Bearer {victor_token}"}
 
         gabriel_auth = self.client.post(
-            "/auth/table-login", json={"name": "Gabriel", "pin": "gabriel"}
+            "/auth/table-login", json=credentials("Gabriel")
         )
         self.assertEqual(gabriel_auth.status_code, 200)
         gabriel_token = gabriel_auth.json()["accessToken"]

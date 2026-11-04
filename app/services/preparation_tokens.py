@@ -7,8 +7,9 @@ receber a senha nem o token de sessão do app. Regras que este módulo garante:
 - **uma credencial por campanha**, emitida pelo GM daquela campanha;
 - o valor em claro existe só na resposta de emissão: no banco fica SHA-256, então
   dump do SQLite não entrega credencial utilizável;
-- token com 256 bits de entropia: não há PIN a adivinhar (diferente do
-  `table_login`, que hoje aceita `pin == nome.lower()`);
+- token com 256 bits de entropia: não há PIN a adivinhar. O login da mesa também
+  passou a comparar PIN com hash (`tools/set_table_pin.py`), mas continua sendo o
+  elo mais fraco da cadeia — mais um motivo para a credencial ter escopo próprio;
 - revogar corta imediatamente — a checagem lê `revoked_at` a cada uso;
 - o token **não** autoriza nada sozinho: ele resolve para o usuário do GM, e as
   stores continuam chamando `CampaignStore.assert_gm`. A restrição de escopo

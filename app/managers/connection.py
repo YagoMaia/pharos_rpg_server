@@ -1,11 +1,13 @@
 import asyncio
 import json
+from collections.abc import Callable
 
 from fastapi import WebSocket
 from redis import asyncio as aioredis
 
 from app.core.config import settings
 from app.models.domain import CombatSession
+from app.services.socket_authorization import close_revoked_socket
 
 
 class ConnectionManager:
@@ -14,14 +16,20 @@ class ConnectionManager:
         self.active_connections: dict[str, list[WebSocket]] = {}
         self.pubsub_tasks: dict[str, asyncio.Task] = {}
         self.subscription_ready: dict[str, asyncio.Event] = {}
+        self.connection_authorizations: dict[WebSocket, Callable[[], bool]] = {}
 
-    async def connect(self, session_id: str, websocket: WebSocket, already_accepted: bool = False):
+    async def connect(
+        self, session_id: str, websocket: WebSocket, already_accepted: bool = False,
+        authorization: Callable[[], bool] | None = None,
+    ):
         session_id = session_id.lower()
         if not already_accepted:
             await websocket.accept()
         if session_id not in self.active_connections:
             self.active_connections[session_id] = []
         self.active_connections[session_id].append(websocket)
+        if authorization is not None:
+            self.connection_authorizations[websocket] = authorization
 
         existing_task = self.pubsub_tasks.get(session_id)
         if existing_task is None or existing_task.done():
@@ -38,6 +46,7 @@ class ConnectionManager:
             raise
 
     def disconnect(self, session_id: str, websocket: WebSocket):
+        self.connection_authorizations.pop(websocket, None)
         session_id = session_id.lower()
         if session_id in self.active_connections:
             try:
@@ -54,6 +63,13 @@ class ConnectionManager:
     async def _safe_send(self, session_id: str, conn: WebSocket, data: str):
         """Limita a espera por cliente; o assinante preserva a ordem dos eventos."""
         try:
+            authorize = self.connection_authorizations.get(conn)
+            if authorize is not None and not await asyncio.to_thread(authorize):
+                # Verificar no envio também: esperar o próximo comando/heartbeat
+                # permitiria entregar estado privado a uma sessão já revogada.
+                await close_revoked_socket(conn)
+                self.disconnect(session_id, conn)
+                return
             await asyncio.wait_for(conn.send_text(data), timeout=5.0)
         except Exception:
             self.disconnect(session_id, conn)
