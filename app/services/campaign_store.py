@@ -136,6 +136,10 @@ class CampaignStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_npcs_campaign
                     ON campaign_npcs(campaign_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS campaign_npc_bestiary_links (
+                    npc_id TEXT PRIMARY KEY REFERENCES campaign_npcs(id) ON DELETE CASCADE,
+                    template_id TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS npc_templates (
                     id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL REFERENCES users(id),

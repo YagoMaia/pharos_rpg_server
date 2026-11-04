@@ -1,4 +1,5 @@
 from pathlib import Path
+from contextlib import closing
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -248,6 +249,44 @@ class CampaignEncountersAndNpcsTests(unittest.TestCase):
             self.assertEqual(restored.phases[0].weapons["melee"].name, "Garra")
             self.assertEqual(restored.spells[0].requiredRace, "Elfo")
         self.assertEqual(created.json()["monstersData"][0]["bestiarySnapshot"], snapshot)
+
+    def test_bestiary_link_table_is_added_to_existing_database_without_losing_npcs(self):
+        gm = {"Authorization": f"Bearer {self.gm_token}"}
+        npc = self.client.post(f"/campaigns/{self.campaign_id}/npcs", headers=gm, json={"name": "NPC anterior"}).json()
+        with closing(self.store._connect()) as conn, conn:
+            conn.execute("DROP TABLE campaign_npc_bestiary_links")
+        CampaignStore(self.db_path)
+        path = f"/campaigns/{self.campaign_id}/npcs/{npc['id']}/bestiary-link"
+        self.assertIsNone(self.client.get(path, headers=gm).json()["templateId"])
+        self.assertEqual(self.client.get(f"/campaigns/{self.campaign_id}/npcs", headers=gm).json()[0]["name"], "NPC anterior")
+
+    def test_bestiary_link_is_private_survives_edits_and_can_be_removed(self):
+        gm = {"Authorization": f"Bearer {self.gm_token}"}
+        player = {"Authorization": f"Bearer {self.p1_token}"}
+        npc = self.client.post(f"/campaigns/{self.campaign_id}/npcs", headers=gm, json={"name": "Aliado", "visibility": "party"}).json()
+        path = f"/campaigns/{self.campaign_id}/npcs/{npc['id']}/bestiary-link"
+        other_id = self.client.post("/campaigns", headers=gm, json={"name": "Outra campanha"}).json()["id"]
+        other_path = f"/campaigns/{other_id}/npcs/{npc['id']}/bestiary-link"
+        self.assertEqual(self.client.put(other_path, headers=gm, json={"templateId": "wolf"}).status_code, 404)
+        self.assertEqual(self.client.get(path).status_code, 401)
+        self.assertIsNone(self.client.get(path, headers=gm).json()["templateId"])
+        self.assertEqual(self.client.put(path, headers=player, json={"templateId": "wolf"}).status_code, 403)
+        self.assertEqual(self.client.get(path, headers=player).status_code, 403)
+        self.assertEqual(self.client.put(path, headers=gm, json={}).status_code, 422)
+        self.assertEqual(self.client.put(path, headers=gm, json={"templateId": "wolf"}).json()["templateId"], "wolf")
+        CampaignStore(self.db_path)
+        self.assertEqual(self.client.get(path, headers=gm).json()["templateId"], "wolf")
+        self.client.put(f"/campaigns/{self.campaign_id}/npcs/{npc['id']}", headers=gm, json={"name": "Aliado", "visibility": "party"})
+        self.assertEqual(self.client.get(path, headers=gm).json()["templateId"], "wolf")
+        self.assertNotIn("templateId", self.client.get(f"/campaigns/{self.campaign_id}/npcs", headers=player).json()[0])
+        self.assertEqual(self.client.put(path, headers=gm, json={"templateId": None}).json()["templateId"], None)
+        self.assertEqual(self.client.put(path, headers=gm, json={"templateId": ""}).status_code, 422)
+        self.assertEqual(self.client.get(f"/campaigns/{self.campaign_id}/npcs/inexistente/bestiary-link", headers=gm).status_code, 404)
+        self.client.put(path, headers=gm, json={"templateId": "wolf"})
+        self.assertEqual(self.client.delete(f"/campaigns/{self.campaign_id}/npcs/{npc['id']}", headers=gm).status_code, 204)
+        self.assertEqual(self.client.get(path, headers=gm).status_code, 404)
+        with closing(self.store._connect()) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM campaign_npc_bestiary_links").fetchone()[0], 0)
 
     def test_npc_dossier_permissions_and_visibility(self):
         # 1. Jogador não pode criar NPC
