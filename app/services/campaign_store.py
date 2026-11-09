@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from app.core.database import open_connection
+from app.core.database import open_connection, write_transaction
 from app.services import campaign_records as records
 
 # Reexportado: `from app.services.campaign_store import CampaignError` já é o
@@ -136,6 +136,10 @@ class CampaignStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_npcs_campaign
                     ON campaign_npcs(campaign_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS campaign_npc_bestiary_links (
+                    npc_id TEXT PRIMARY KEY REFERENCES campaign_npcs(id) ON DELETE CASCADE,
+                    template_id TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS npc_templates (
                     id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL REFERENCES users(id),
@@ -951,6 +955,52 @@ class CampaignStore:
             )
             if deleted.rowcount == 0:
                 raise CampaignError(404, "NPC não encontrado.")
+
+    def _assert_gm_npc(self, conn: sqlite3.Connection, campaign_id: str, user_id: str, npc_id: str) -> None:
+        if self._member(conn, campaign_id, user_id)["role"] != "gm":
+            raise CampaignError(403, "Apenas o mestre pode acessar o vínculo do bestiário.")
+        if not conn.execute(
+            "SELECT 1 FROM campaign_npcs WHERE id = ? AND campaign_id = ?", (npc_id, campaign_id)
+        ).fetchone():
+            raise CampaignError(404, "NPC não encontrado.")
+
+    def npc_bestiary_link(self, user_id: str, campaign_id: str, npc_id: str) -> str | None:
+        """Devolve a ficha do bestiário vinculada ao NPC, ou None.
+
+        O vínculo é privado do mestre: nunca aparece na lista de NPCs e não
+        altera `combat_data`. Exemplo:
+        `store.npc_bestiary_link(gm_id, campaign_id, npc_id) -> "lobo"`.
+        """
+        with closing(self._connect()) as conn:
+            self._assert_gm_npc(conn, campaign_id, user_id, npc_id)
+            row = conn.execute(
+                "SELECT template_id FROM campaign_npc_bestiary_links WHERE npc_id = ?", (npc_id,)
+            ).fetchone()
+            return row["template_id"] if row else None
+
+    def set_npc_bestiary_link(
+        self, user_id: str, campaign_id: str, npc_id: str, template_id: str | None
+    ) -> None:
+        """Vincula uma ficha ou remove o vínculo quando `template_id` é None.
+
+        Usa `write_transaction` porque a checagem de papel e a escrita precisam
+        da mesma transação; dois mestre-encontros concorrentes não podem
+        sobrescrever o vínculo lido fora do lock. Exemplo:
+        `store.set_npc_bestiary_link(gm_id, campaign_id, npc_id, None)`.
+        """
+        with write_transaction(self.path) as conn:
+            self._assert_gm_npc(conn, campaign_id, user_id, npc_id)
+            if template_id is None:
+                conn.execute(
+                    "DELETE FROM campaign_npc_bestiary_links WHERE npc_id = ?", (npc_id,)
+                )
+                return
+            conn.execute(
+                """INSERT INTO campaign_npc_bestiary_links (npc_id, template_id)
+                VALUES (?, ?)
+                ON CONFLICT(npc_id) DO UPDATE SET template_id = excluded.template_id""",
+                (npc_id, template_id),
+            )
 
     @staticmethod
     def _npc_template(row: sqlite3.Row) -> dict:

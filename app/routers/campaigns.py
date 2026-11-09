@@ -133,6 +133,11 @@ class NpcTemplateBody(BaseModel):
     updatedAt: str | None = None
 
 
+class NpcBestiaryLinkBody(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    templateId: str | None = Field(min_length=1, max_length=200)
+
+
 class NpcTemplateSyncBody(BaseModel):
     templates: list[NpcTemplateBody] = Field(default_factory=list)
 
@@ -495,6 +500,17 @@ async def launch_encounter(
 
 
 # --- NPCS ---
+@router.get("/campaigns/{campaign_id}/npcs/{npc_id}/bestiary-link")
+def get_npc_bestiary_link(campaign_id: str, npc_id: str, user: User, store: Store):
+    return {"templateId": store.npc_bestiary_link(user["id"], campaign_id, npc_id)}
+
+
+@router.put("/campaigns/{campaign_id}/npcs/{npc_id}/bestiary-link")
+def put_npc_bestiary_link(campaign_id: str, npc_id: str, body: NpcBestiaryLinkBody, user: User, store: Store):
+    store.set_npc_bestiary_link(user["id"], campaign_id, npc_id, body.templateId)
+    return {"templateId": body.templateId}
+
+
 @router.get("/campaigns/{campaign_id}/npcs")
 def list_npcs(campaign_id: str, user: User, store: Store):
     return store.list_npcs(user["id"], campaign_id)
