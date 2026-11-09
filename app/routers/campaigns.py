@@ -502,16 +502,12 @@ async def launch_encounter(
 # --- NPCS ---
 @router.get("/campaigns/{campaign_id}/npcs/{npc_id}/bestiary-link")
 def get_npc_bestiary_link(campaign_id: str, npc_id: str, user: User, store: Store):
-    from app.services.npc_bestiary_links import read_npc_bestiary_link
-
-    return {"templateId": read_npc_bestiary_link(store, user["id"], campaign_id, npc_id)}
+    return {"templateId": store.npc_bestiary_link(user["id"], campaign_id, npc_id)}
 
 
 @router.put("/campaigns/{campaign_id}/npcs/{npc_id}/bestiary-link")
 def put_npc_bestiary_link(campaign_id: str, npc_id: str, body: NpcBestiaryLinkBody, user: User, store: Store):
-    from app.services.npc_bestiary_links import write_npc_bestiary_link
-
-    write_npc_bestiary_link(store, user["id"], campaign_id, npc_id, body.templateId)
+    store.set_npc_bestiary_link(user["id"], campaign_id, npc_id, body.templateId)
     return {"templateId": body.templateId}
 
 
