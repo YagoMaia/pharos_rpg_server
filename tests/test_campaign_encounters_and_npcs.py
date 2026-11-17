@@ -1,7 +1,8 @@
-from pathlib import Path
-from contextlib import closing
-from tempfile import TemporaryDirectory
+import sqlite3
 import unittest
+from contextlib import closing
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
@@ -386,3 +387,195 @@ class CampaignEncountersAndNpcsTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {self.gm_token}"},
         )
         self.assertEqual(del_resp.status_code, 204)
+
+    def test_npc_visibility_for_specific_players(self):
+        p2_resp = self.client.post("/auth/table-login", json={"name": "Leandro", "pin": "leandro"})
+        self.assertEqual(p2_resp.status_code, 200)
+        p2_token = p2_resp.json()["accessToken"]
+
+        inv = self.client.post(
+            f"/campaigns/{self.campaign_id}/invites",
+            headers={"Authorization": f"Bearer {self.gm_token}"},
+        )
+        self.assertEqual(inv.status_code, 201)
+        join_resp = self.client.post(
+            "/campaigns/join",
+            headers={"Authorization": f"Bearer {p2_token}"},
+            json={"inviteCode": inv.json()["code"]},
+        )
+        self.assertEqual(join_resp.status_code, 200)
+
+        camp = self.client.get(
+            f"/campaigns/{self.campaign_id}",
+            headers={"Authorization": f"Bearer {self.gm_token}"},
+        ).json()
+        by_name = {m["name"]: m["id"] for m in camp["members"]}
+        p1_id = by_name["Gabriel"]
+        p2_id = by_name["Leandro"]
+        gm_id = by_name["Victor"]
+
+        # Lista vazia ou ID inválido / do GM deve falhar com 422
+        empty_selected = self.client.post(
+            f"/campaigns/{self.campaign_id}/npcs",
+            headers={"Authorization": f"Bearer {self.gm_token}"},
+            json={
+                "name": "Contato Secreto",
+                "visibility": "selected",
+                "visibleToMemberIds": [],
+            },
+        )
+        self.assertEqual(empty_selected.status_code, 422)
+
+        gm_selected = self.client.post(
+            f"/campaigns/{self.campaign_id}/npcs",
+            headers={"Authorization": f"Bearer {self.gm_token}"},
+            json={
+                "name": "Contato do GM",
+                "visibility": "selected",
+                "visibleToMemberIds": [gm_id],
+            },
+        )
+        self.assertEqual(gm_selected.status_code, 422)
+
+        unknown_selected = self.client.post(
+            f"/campaigns/{self.campaign_id}/npcs",
+            headers={"Authorization": f"Bearer {self.gm_token}"},
+            json={
+                "name": "Contato Fantasma",
+                "visibility": "selected",
+                "visibleToMemberIds": ["usuario-inexistente"],
+            },
+        )
+        self.assertEqual(unknown_selected.status_code, 422)
+
+        # GM cria NPC visível apenas para Gabriel (p1)
+        created = self.client.post(
+            f"/campaigns/{self.campaign_id}/npcs",
+            headers={"Authorization": f"Bearer {self.gm_token}"},
+            json={
+                "name": "Informante da Guilda",
+                "role": "Contato do Gabriel",
+                "attitude": "friendly",
+                "description": "Só o Gabriel conhece este informante.",
+                "gmNotes": "Entrega a chave do cofre na sessão 3.",
+                "visibility": "selected",
+                "visibleToMemberIds": [p1_id, p1_id],
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        npc = created.json()
+        self.assertEqual(npc["visibility"], "selected")
+        self.assertEqual(npc["visibleToMemberIds"], [p1_id])
+        npc_id = npc["id"]
+
+        # Gabriel vê o NPC (sem gmNotes nem lista de outros destinatários); Leandro não vê
+        p1_npcs = self.client.get(
+            f"/campaigns/{self.campaign_id}/npcs",
+            headers={"Authorization": f"Bearer {self.p1_token}"},
+        ).json()
+        self.assertEqual([n["id"] for n in p1_npcs], [npc_id])
+        self.assertEqual(p1_npcs[0]["visibility"], "selected")
+        self.assertNotIn("gmNotes", p1_npcs[0])
+        self.assertNotIn("visibleToMemberIds", p1_npcs[0])
+
+        p2_npcs = self.client.get(
+            f"/campaigns/{self.campaign_id}/npcs",
+            headers={"Authorization": f"Bearer {p2_token}"},
+        ).json()
+        self.assertEqual(p2_npcs, [])
+
+        # GM libera também para Leandro (p2) -> ambos veem
+        updated = self.client.put(
+            f"/campaigns/{self.campaign_id}/npcs/{npc_id}",
+            headers={"Authorization": f"Bearer {self.gm_token}"},
+            json={
+                "name": "Informante da Guilda",
+                "role": "Contato duplo",
+                "attitude": "friendly",
+                "description": "Agora Leandro também conhece.",
+                "gmNotes": "Nota privada.",
+                "visibility": "selected",
+                "visibleToMemberIds": [p1_id, p2_id],
+            },
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(sorted(updated.json()["visibleToMemberIds"]), sorted([p1_id, p2_id]))
+
+        p2_npcs_after = self.client.get(
+            f"/campaigns/{self.campaign_id}/npcs",
+            headers={"Authorization": f"Bearer {p2_token}"},
+        ).json()
+        self.assertEqual([n["id"] for n in p2_npcs_after], [npc_id])
+        self.assertNotIn("visibleToMemberIds", p2_npcs_after[0])
+
+        # GM revela para toda a party -> limpa visibleToMemberIds
+        revealed = self.client.put(
+            f"/campaigns/{self.campaign_id}/npcs/{npc_id}",
+            headers={"Authorization": f"Bearer {self.gm_token}"},
+            json={
+                "name": "Informante da Guilda",
+                "visibility": "party",
+                "visibleToMemberIds": [p1_id],
+            },
+        )
+        self.assertEqual(revealed.status_code, 200)
+        self.assertEqual(revealed.json()["visibility"], "party")
+        self.assertEqual(revealed.json()["visibleToMemberIds"], [])
+
+    def test_legacy_db_migrates_npc_visibility_preserving_bestiary_links(self):
+        legacy_path = Path(self.tmp.name) / "legacy_npcs.sqlite3"
+        with closing(sqlite3.connect(legacy_path)) as conn, conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.executescript("""
+                CREATE TABLE users (
+                    id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL, password_hash TEXT NOT NULL
+                );
+                CREATE TABLE campaigns (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, gm_id TEXT NOT NULL REFERENCES users(id)
+                );
+                CREATE TABLE members (
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    user_id TEXT NOT NULL REFERENCES users(id),
+                    role TEXT NOT NULL CHECK (role IN ('gm', 'player')),
+                    character_id TEXT,
+                    character_data TEXT,
+                    PRIMARY KEY (campaign_id, user_id)
+                );
+                CREATE TABLE campaign_npcs (
+                    id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    name TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT '',
+                    attitude TEXT NOT NULL DEFAULT 'neutral' CHECK (attitude IN ('friendly', 'neutral', 'hostile', 'unknown')),
+                    description TEXT NOT NULL DEFAULT '',
+                    gm_notes TEXT NOT NULL DEFAULT '',
+                    combat_data TEXT,
+                    visibility TEXT NOT NULL CHECK (visibility IN ('party', 'gm')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE campaign_npc_bestiary_links (
+                    npc_id TEXT PRIMARY KEY REFERENCES campaign_npcs(id) ON DELETE CASCADE,
+                    template_id TEXT NOT NULL
+                );
+            """)
+            conn.execute("INSERT INTO users VALUES ('u-gm', 'gm@x.test', 'Victor', 'h')")
+            conn.execute("INSERT INTO users VALUES ('u-p1', 'p1@x.test', 'Gabriel', 'h')")
+            conn.execute("INSERT INTO campaigns VALUES ('c-1', 'Mesa Antiga', 'u-gm')")
+            conn.execute("INSERT INTO members VALUES ('c-1', 'u-gm', 'gm', NULL, NULL)")
+            conn.execute("INSERT INTO members VALUES ('c-1', 'u-p1', 'player', NULL, NULL)")
+            conn.execute(
+                "INSERT INTO campaign_npcs VALUES ('npc-leg-1', 'c-1', 'Ferias', 'Ferreiro', 'friendly', 'Desc', 'Segredo', NULL, 'gm', '2026-01-01', '2026-01-01')"
+            )
+            conn.execute("INSERT INTO campaign_npc_bestiary_links VALUES ('npc-leg-1', 'tpl-ferreiro')")
+
+        migrated = CampaignStore(legacy_path)
+        self.assertEqual(migrated.npc_bestiary_link("u-gm", "c-1", "npc-leg-1"), "tpl-ferreiro")
+
+        updated = migrated.update_npc(
+            "u-gm", "c-1", "npc-leg-1", "Ferias", "Ferreiro", "friendly", "Desc", "Segredo", None, "selected", ["u-p1"]
+        )
+        self.assertEqual(updated["visibility"], "selected")
+        self.assertEqual(updated["visibleToMemberIds"], ["u-p1"])
+        self.assertEqual(migrated.npc_bestiary_link("u-gm", "c-1", "npc-leg-1"), "tpl-ferreiro")

@@ -130,7 +130,7 @@ class CampaignStore:
                     description TEXT NOT NULL DEFAULT '',
                     gm_notes TEXT NOT NULL DEFAULT '',
                     combat_data TEXT,
-                    visibility TEXT NOT NULL CHECK (visibility IN ('party', 'gm')),
+                    visibility TEXT NOT NULL CHECK (visibility IN ('party', 'gm', 'selected')),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -156,6 +156,51 @@ class CampaignStore:
             cols = [row["name"] for row in conn.execute("PRAGMA table_info(members)").fetchall()]
             if "character_data" not in cols:
                 conn.execute("ALTER TABLE members ADD COLUMN character_data TEXT")
+        self._migrate_npc_visibility()
+
+    def _migrate_npc_visibility(self) -> None:
+        with closing(sqlite3.connect(self.path, timeout=5)) as conn:
+            conn.row_factory = sqlite3.Row
+            # Mantém foreign_keys OFF durante eventual rebuild para não disparar
+            # ON DELETE CASCADE sobre campaign_npc_bestiary_links.
+            conn.execute("PRAGMA foreign_keys = OFF")
+            ddl = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'campaign_npcs'"
+            ).fetchone()
+            if ddl and ddl["sql"] and "'selected'" not in ddl["sql"]:
+                with conn:
+                    conn.executescript("""
+                        CREATE TABLE campaign_npcs_new (
+                            id TEXT PRIMARY KEY,
+                            campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                            name TEXT NOT NULL,
+                            role TEXT NOT NULL DEFAULT '',
+                            attitude TEXT NOT NULL DEFAULT 'neutral' CHECK (attitude IN ('friendly', 'neutral', 'hostile', 'unknown')),
+                            description TEXT NOT NULL DEFAULT '',
+                            gm_notes TEXT NOT NULL DEFAULT '',
+                            combat_data TEXT,
+                            visibility TEXT NOT NULL CHECK (visibility IN ('party', 'gm', 'selected')),
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        );
+                        INSERT INTO campaign_npcs_new
+                        SELECT id, campaign_id, name, role, attitude, description, gm_notes, combat_data, visibility, created_at, updated_at
+                        FROM campaign_npcs;
+                        DROP TABLE campaign_npcs;
+                        ALTER TABLE campaign_npcs_new RENAME TO campaign_npcs;
+                        CREATE INDEX IF NOT EXISTS idx_npcs_campaign
+                            ON campaign_npcs(campaign_id, created_at DESC);
+                    """)
+            with conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS campaign_npc_visibility (
+                        npc_id TEXT NOT NULL REFERENCES campaign_npcs(id) ON DELETE CASCADE,
+                        user_id TEXT NOT NULL REFERENCES users(id),
+                        PRIMARY KEY (npc_id, user_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_npc_visibility_user
+                        ON campaign_npc_visibility(user_id, npc_id);
+                """)
 
     def _connect(self) -> sqlite3.Connection:
         return open_connection(self.path)
@@ -840,12 +885,16 @@ class CampaignStore:
 
     # --- NPCS ---
     @staticmethod
-    def _npc(row: sqlite3.Row, is_gm: bool) -> dict:
+    def _npc(
+        row: sqlite3.Row,
+        is_gm: bool,
+        visible_to_member_ids: list[str] | None = None,
+    ) -> dict:
         combat = None
         if row["combat_data"]:
             try:
                 combat = json.loads(row["combat_data"])
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 combat = None
         data = {
             "id": row["id"],
@@ -861,7 +910,75 @@ class CampaignStore:
         }
         if is_gm:
             data["gmNotes"] = row["gm_notes"]
+            data["visibleToMemberIds"] = (
+                list(visible_to_member_ids or [])
+                if row["visibility"] == "selected"
+                else []
+            )
         return data
+
+    @staticmethod
+    def _resolve_npc_targets(
+        conn: sqlite3.Connection,
+        campaign_id: str,
+        visibility: str,
+        visible_to_member_ids: list[str] | None,
+    ) -> list[str]:
+        if visibility != "selected":
+            return []
+        unique_ids = list(
+            dict.fromkeys(
+                mid.strip()
+                for mid in (visible_to_member_ids or [])
+                if isinstance(mid, str) and mid.strip()
+            )
+        )
+        if not unique_ids:
+            raise CampaignError(
+                422,
+                "Selecione ao menos um jogador para visibilidade específica.",
+            )
+        player_rows = conn.execute(
+            "SELECT user_id FROM members WHERE campaign_id = ? AND role = 'player'",
+            (campaign_id,),
+        ).fetchall()
+        valid_players = {row["user_id"] for row in player_rows}
+        if any(mid not in valid_players for mid in unique_ids):
+            raise CampaignError(
+                422,
+                "Os destinatários do NPC devem ser jogadores membros da campanha.",
+            )
+        return unique_ids
+
+    @staticmethod
+    def _save_npc_visibility(
+        conn: sqlite3.Connection,
+        npc_id: str,
+        member_ids: list[str],
+    ) -> None:
+        conn.execute("DELETE FROM campaign_npc_visibility WHERE npc_id = ?", (npc_id,))
+        for member_id in member_ids:
+            conn.execute(
+                "INSERT INTO campaign_npc_visibility (npc_id, user_id) VALUES (?, ?)",
+                (npc_id, member_id),
+            )
+
+    @staticmethod
+    def _npc_visible_map(
+        conn: sqlite3.Connection,
+        npc_ids: list[str],
+    ) -> dict[str, list[str]]:
+        if not npc_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in npc_ids)
+        rows = conn.execute(
+            f"SELECT npc_id, user_id FROM campaign_npc_visibility WHERE npc_id IN ({placeholders}) ORDER BY user_id",
+            tuple(npc_ids),
+        ).fetchall()
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            result.setdefault(row["npc_id"], []).append(row["user_id"])
+        return result
 
     def list_npcs(self, user_id: str, campaign_id: str) -> list[dict]:
         with closing(self._connect()) as conn:
@@ -874,14 +991,18 @@ class CampaignStore:
                     ORDER BY created_at DESC, id DESC""",
                     (campaign_id,),
                 ).fetchall()
-            else:
-                rows = conn.execute(
-                    """SELECT * FROM campaign_npcs
-                    WHERE campaign_id = ? AND visibility = 'party'
-                    ORDER BY created_at DESC, id DESC""",
-                    (campaign_id,),
-                ).fetchall()
-            return [self._npc(row, is_gm) for row in rows]
+                vis_map = self._npc_visible_map(conn, [row["id"] for row in rows])
+                return [self._npc(row, True, vis_map.get(row["id"])) for row in rows]
+            rows = conn.execute(
+                """SELECT DISTINCT n.* FROM campaign_npcs n
+                LEFT JOIN campaign_npc_visibility v
+                  ON v.npc_id = n.id AND v.user_id = ?
+                WHERE n.campaign_id = ?
+                  AND (n.visibility = 'party' OR (n.visibility = 'selected' AND v.user_id IS NOT NULL))
+                ORDER BY n.created_at DESC, n.id DESC""",
+                (user_id, campaign_id),
+            ).fetchall()
+            return [self._npc(row, False) for row in rows]
 
     def create_npc(
         self,
@@ -894,10 +1015,14 @@ class CampaignStore:
         gm_notes: str = "",
         combat_data: dict | None = None,
         visibility: str = "party",
+        visible_to_member_ids: list[str] | None = None,
     ) -> dict:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode criar NPCs.")
+            target_ids = self._resolve_npc_targets(
+                conn, campaign_id, visibility, visible_to_member_ids
+            )
             row = records.insert_npc(
                 conn,
                 campaign_id,
@@ -911,7 +1036,8 @@ class CampaignStore:
                     "visibility": visibility,
                 },
             )
-            return self._npc(row, is_gm=True)
+            self._save_npc_visibility(conn, row["id"], target_ids)
+            return self._npc(row, is_gm=True, visible_to_member_ids=target_ids)
 
     def update_npc(
         self,
@@ -925,10 +1051,14 @@ class CampaignStore:
         gm_notes: str = "",
         combat_data: dict | None = None,
         visibility: str = "party",
+        visible_to_member_ids: list[str] | None = None,
     ) -> dict:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode editar NPCs.")
+            target_ids = self._resolve_npc_targets(
+                conn, campaign_id, visibility, visible_to_member_ids
+            )
             row = records.update_npc(
                 conn,
                 campaign_id,
@@ -943,7 +1073,8 @@ class CampaignStore:
                     "visibility": visibility,
                 },
             )
-            return self._npc(row, is_gm=True)
+            self._save_npc_visibility(conn, npc_id, target_ids)
+            return self._npc(row, is_gm=True, visible_to_member_ids=target_ids)
 
     def delete_npc(self, user_id: str, campaign_id: str, npc_id: str) -> None:
         with closing(self._connect()) as conn, conn:
