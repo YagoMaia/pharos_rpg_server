@@ -121,7 +121,8 @@ class NpcBody(BaseModel):
     description: str = Field(default="", max_length=20000)
     gmNotes: str = Field(default="", max_length=20000)
     combatData: dict | None = None
-    visibility: Literal["party", "gm"] = "party"
+    visibility: Literal["party", "gm", "selected"] = "party"
+    visibleToMemberIds: list[str] = Field(default_factory=list, max_length=100)
 
 
 class NpcTemplateBody(BaseModel):
@@ -528,6 +529,7 @@ def create_npc(campaign_id: str, body: NpcBody, user: User, store: Store):
         body.gmNotes,
         body.combatData,
         body.visibility,
+        body.visibleToMemberIds,
     )
 
 
@@ -544,6 +546,7 @@ def update_npc(campaign_id: str, npc_id: str, body: NpcBody, user: User, store: 
         body.gmNotes,
         body.combatData,
         body.visibility,
+        body.visibleToMemberIds,
     )
 
 
