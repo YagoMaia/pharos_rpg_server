@@ -143,6 +143,27 @@ class NpcTemplateSyncBody(BaseModel):
     templates: list[NpcTemplateBody] = Field(default_factory=list)
 
 
+class CompendiumEntryBody(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    slug: str = Field(default="", max_length=120)
+    kind: Literal["fauna", "flora"]
+    name: str = Field(min_length=1, max_length=120)
+    subtitle: str = Field(default="", max_length=200)
+    region: str = Field(default="", max_length=120)
+    subtype: str = Field(default="", max_length=120)
+    dangerLabel: str = Field(default="", max_length=80)
+    materialLabel: str = Field(default="", max_length=120)
+    lore: str = Field(default="", max_length=40000)
+    image: str | None = Field(default=None, max_length=2_000_000)
+    visibility: Literal["gm", "party", "selected"] = "gm"
+    visibleToMemberIds: list[str] = Field(default_factory=list, max_length=100)
+    combatTemplateId: str | None = Field(default=None, max_length=200)
+
+
+class CompendiumNoteBody(BaseModel):
+    note: str = Field(default="", max_length=20000)
+
+
 Store = Annotated[CampaignStore, Depends(get_campaign_store)]
 User = Annotated[dict, Depends(current_user)]
 
@@ -448,6 +469,7 @@ async def launch_encounter(
                 name=combatant_name,
                 baseName=name if snapshot else None,
                 image=snapshot.get("image"),
+                compendiumSlug=snapshot.get("compendiumSlug"),
                 type="npc",
                 armorClass=ac_val,
                 baseArmorClass=ac_val,
@@ -468,6 +490,8 @@ async def launch_encounter(
                 speed=snapshot.get("speed"),
                 equipment=snapshot.get("equipment"),
                 actions=snapshot.get("actions"),
+                legendaryActionsMax=int(snapshot.get("legendaryActionsMax") or m.get("legendaryActionsMax") or 0),
+                legendaryActionsRemaining=int(snapshot.get("legendaryActionsMax") or m.get("legendaryActionsMax") or 0),
             )
             state.combatants[combatant_id] = combatant
             state.turn_order.append(combatant_id)
@@ -598,5 +622,69 @@ def delete_npc_template(template_id: str, user: User, store: Store):
 def sync_npc_templates(body: NpcTemplateSyncBody, user: User, store: Store):
     local_dicts = [t.model_dump() for t in body.templates]
     return store.sync_npc_templates(user["id"], local_dicts)
+
+
+def _compendium_payload(body: CompendiumEntryBody) -> dict:
+    return {
+        "slug": body.slug,
+        "kind": body.kind,
+        "name": body.name,
+        "subtitle": body.subtitle,
+        "region": body.region,
+        "subtype": body.subtype,
+        "danger_label": body.dangerLabel,
+        "material_label": body.materialLabel,
+        "lore": body.lore,
+        "image": body.image,
+        "visibility": body.visibility,
+        "visible_to_member_ids": body.visibleToMemberIds,
+        "combat_template_id": body.combatTemplateId,
+    }
+
+
+@router.get("/campaigns/{campaign_id}/compendium")
+def list_compendium(campaign_id: str, user: User, store: Store):
+    return store.list_compendium(user["id"], campaign_id)
+
+
+@router.post("/campaigns/{campaign_id}/compendium", status_code=201)
+def create_or_upsert_compendium(
+    campaign_id: str, body: CompendiumEntryBody, user: User, store: Store
+):
+    return store.upsert_compendium_entry(
+        user["id"], campaign_id, _compendium_payload(body)
+    )
+
+
+@router.patch("/campaigns/{campaign_id}/compendium/{entry_id}")
+def update_compendium(
+    campaign_id: str,
+    entry_id: str,
+    body: CompendiumEntryBody,
+    user: User,
+    store: Store,
+):
+    return store.upsert_compendium_entry(
+        user["id"], campaign_id, _compendium_payload(body), entry_id=entry_id
+    )
+
+
+@router.delete("/campaigns/{campaign_id}/compendium/{entry_id}", status_code=204)
+def delete_compendium(campaign_id: str, entry_id: str, user: User, store: Store):
+    store.delete_compendium_entry(user["id"], campaign_id, entry_id)
+    return Response(status_code=204)
+
+
+@router.put("/campaigns/{campaign_id}/compendium/{entry_id}/notes")
+def save_compendium_note(
+    campaign_id: str,
+    entry_id: str,
+    body: CompendiumNoteBody,
+    user: User,
+    store: Store,
+):
+    return store.save_compendium_note(
+        user["id"], campaign_id, entry_id, body.note
+    )
 
 

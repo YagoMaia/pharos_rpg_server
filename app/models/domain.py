@@ -10,7 +10,9 @@ CharacterClass = Literal[
     "Guerreiro", "Corsário", "Vanguarda", "Mago", "Apóstata", "Atirador", "Orador"
 ]
 
-ActionType = Literal["Padrão", "Movimento", "Reação", "Completa", "Livre", "Ação Bônus"]
+ActionType = Literal[
+    "Padrão", "Movimento", "Reação", "Completa", "Livre", "Ação Bônus", "Ação Lendária"
+]
 
 
 class Attribute(BaseModel):
@@ -45,6 +47,9 @@ class Skill(BaseModel):
 
     isHealing: Optional[bool] = False
     healFormula: Optional[str] = None
+    isBuff: Optional[bool] = False
+    buffEffect: Optional[str] = None
+    legendaryCost: Optional[int] = 1
 
     # Se quiser tipar o dicionário do saveRequest:
     saveRequest: Optional[Dict[str, Any]] = None
@@ -141,6 +146,7 @@ class Combatant(BaseModel):
     name: str
     baseName: Optional[str] = None
     image: Optional[str] = None
+    compendiumSlug: Optional[str] = None
     feats: List[CombatFeat] = Field(default_factory=list)
     factionFeat: Optional[CombatFeat] = None
     specialFeat: Optional[CombatFeat] = None
@@ -176,6 +182,8 @@ class Combatant(BaseModel):
 
     turnActions: TurnActions
     deathSaves: DeathSaves = DeathSaves()
+    legendaryActionsMax: int = Field(default=0, ge=0)
+    legendaryActionsRemaining: int = Field(default=0, ge=0)
 
 
 class CombatSession(BaseModel):

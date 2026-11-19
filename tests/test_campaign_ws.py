@@ -262,3 +262,49 @@ class CampaignSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (await manager.get_state(f"campaign-{self.campaign_id}")).combatants, {}
         )
+
+    async def test_reconnect_receives_state_snapshot_when_combat_is_active(self):
+        manager = MemoryManager()
+        room = f"campaign-{self.campaign_id}"
+        active_session = CombatSession(
+            session_id=room,
+            turn_order=["npc-1"],
+            combatants={
+                "npc-1": {
+                    **actor("npc-1"),
+                    "name": "Sentinela",
+                    "type": "npc",
+                    "initiative": 15,
+                    "hp": {"current": 40, "max": 40},
+                    "focus": {"current": 4, "max": 4},
+                    "armorClass": 16,
+                }
+            },
+            logs=["Combate em andamento."],
+        )
+        await manager.broadcast_state(room, active_session)
+
+        socket = Mock(
+            accept=AsyncMock(),
+            close=AsyncMock(),
+            send_json=AsyncMock(),
+            receive_text=AsyncMock(
+                side_effect=[
+                    json.dumps(
+                        {"type": "AUTH_CAMPAIGN", "payload": {"token": self.gm_token}}
+                    ),
+                    WebSocketDisconnect(),
+                ]
+            ),
+        )
+        with (
+            patch.object(ws_router, "manager", manager),
+            patch.object(ws_router, "game_logic", GameLogic(manager)),
+            patch.object(ws_router, "get_campaign_store", return_value=self.store),
+        ):
+            await ws_router.websocket_endpoint(socket, room)
+
+        sent = [call.args[0] for call in socket.send_json.await_args_list]
+        self.assertEqual(sent[0]["type"], "AUTH_OK")
+        self.assertEqual(sent[1]["type"], "STATE_SNAPSHOT")
+        self.assertIn("npc-1", sent[1]["combatants"])

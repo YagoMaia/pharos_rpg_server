@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from app.core.database import open_connection, write_transaction
 from app.services import campaign_records as records
+from app.services import compendium_records
 
 # Reexportado: `from app.services.campaign_store import CampaignError` já é o
 # caminho usado por rotas, stores de preparação e testes.
@@ -151,6 +152,34 @@ class CampaignStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_npc_templates_user
                     ON npc_templates(user_id, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS campaign_compendium_entries (
+                    id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    slug TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL CHECK (kind IN ('fauna', 'flora')),
+                    name TEXT NOT NULL,
+                    subtitle TEXT NOT NULL DEFAULT '',
+                    region TEXT NOT NULL DEFAULT '',
+                    subtype TEXT NOT NULL DEFAULT '',
+                    danger_label TEXT NOT NULL DEFAULT '',
+                    material_label TEXT NOT NULL DEFAULT '',
+                    lore TEXT NOT NULL DEFAULT '',
+                    image TEXT,
+                    visibility TEXT NOT NULL DEFAULT 'gm' CHECK (visibility IN ('gm', 'party', 'selected')),
+                    visible_to_member_ids_json TEXT NOT NULL DEFAULT '[]',
+                    combat_template_id TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_compendium_campaign
+                    ON campaign_compendium_entries(campaign_id, kind, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS campaign_compendium_notes (
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    entry_id TEXT NOT NULL REFERENCES campaign_compendium_entries(id) ON DELETE CASCADE,
+                    user_id TEXT NOT NULL REFERENCES users(id),
+                    note TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (campaign_id, entry_id, user_id)
+                );
             """)
             # Migration segura para character_data em bases SQLite já criadas
             cols = [row["name"] for row in conn.execute("PRAGMA table_info(members)").fetchall()]
@@ -1153,6 +1182,52 @@ class CampaignStore:
             ).fetchall()
             return [self._npc_template(row) for row in rows]
 
+    # --- COMPÊNDIO (BESTIÁRIO & HERBÁRIO) ---
+    def list_compendium(self, user_id: str, campaign_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            role = self._member(conn, campaign_id, user_id)["role"]
+            return compendium_records.list_compendium_rows(
+                conn, campaign_id, user_id, is_gm=role == "gm"
+            )
+
+    def upsert_compendium_entry(
+        self,
+        user_id: str,
+        campaign_id: str,
+        data: dict,
+        entry_id: str | None = None,
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode editar o compêndio.")
+            if not (data.get("name") or "").strip():
+                raise CampaignError(400, "Nome da entrada é obrigatório.")
+            return compendium_records.upsert_compendium_entry(
+                conn, campaign_id, data, entry_id=entry_id
+            )
+
+    def delete_compendium_entry(
+        self, user_id: str, campaign_id: str, entry_id: str
+    ) -> None:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode excluir entradas.")
+            deleted = conn.execute(
+                "DELETE FROM campaign_compendium_entries WHERE id = ? AND campaign_id = ?",
+                (entry_id, campaign_id),
+            )
+            if deleted.rowcount == 0:
+                raise CampaignError(404, "Entrada do compêndio não encontrada.")
+
+    def save_compendium_note(
+        self, user_id: str, campaign_id: str, entry_id: str, note: str
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            role = self._member(conn, campaign_id, user_id)["role"]
+            return compendium_records.save_compendium_note(
+                conn, campaign_id, entry_id, user_id, note, is_gm=role == "gm"
+            )
+
     def create_npc_template(
         self,
         user_id: str,
@@ -1254,5 +1329,51 @@ class CampaignStore:
                 (user_id,),
             ).fetchall()
             return [self._npc_template(row) for row in rows]
+
+    # --- COMPÊNDIO (BESTIÁRIO & HERBÁRIO) ---
+    def list_compendium(self, user_id: str, campaign_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            role = self._member(conn, campaign_id, user_id)["role"]
+            return compendium_records.list_compendium_rows(
+                conn, campaign_id, user_id, is_gm=role == "gm"
+            )
+
+    def upsert_compendium_entry(
+        self,
+        user_id: str,
+        campaign_id: str,
+        data: dict,
+        entry_id: str | None = None,
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode editar o compêndio.")
+            if not (data.get("name") or "").strip():
+                raise CampaignError(400, "Nome da entrada é obrigatório.")
+            return compendium_records.upsert_compendium_entry(
+                conn, campaign_id, data, entry_id=entry_id
+            )
+
+    def delete_compendium_entry(
+        self, user_id: str, campaign_id: str, entry_id: str
+    ) -> None:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode excluir entradas.")
+            deleted = conn.execute(
+                "DELETE FROM campaign_compendium_entries WHERE id = ? AND campaign_id = ?",
+                (entry_id, campaign_id),
+            )
+            if deleted.rowcount == 0:
+                raise CampaignError(404, "Entrada do compêndio não encontrada.")
+
+    def save_compendium_note(
+        self, user_id: str, campaign_id: str, entry_id: str, note: str
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            role = self._member(conn, campaign_id, user_id)["role"]
+            return compendium_records.save_compendium_note(
+                conn, campaign_id, entry_id, user_id, note, is_gm=role == "gm"
+            )
 
 

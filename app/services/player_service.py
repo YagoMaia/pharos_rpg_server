@@ -274,11 +274,13 @@ class PlayerService:
         if next_actor.hp.current <= 0:
             next_actor.turnActions.standard, next_actor.turnActions.bonus = True, False
             next_actor.turnActions.reaction = False
+            next_actor.legendaryActionsRemaining = 0
             log_msg = f"🚑 --- Turno de {next_actor.name} (TESTE DE MORTE) ---"
         else:
             next_actor.turnActions.standard = True
             next_actor.turnActions.bonus = True
             next_actor.turnActions.reaction = True
+            next_actor.legendaryActionsRemaining = max(0, next_actor.legendaryActionsMax)
 
             log_msg = f"⚔️ --- Turno de {next_actor.name} ---"
 
@@ -329,6 +331,7 @@ class PlayerService:
                 "turnIndex": state.turn_index,
                 "log": log_msg,
                 "turnActions": next_actor.turnActions.model_dump(),
+                "legendaryActionsRemaining": next_actor.legendaryActionsRemaining,
                 "conditions": [c.model_dump() for c in next_actor.conditions],
             },
         )
@@ -348,22 +351,25 @@ class PlayerService:
             return
 
         # Validação de Economia de Ações
-        cost_attr = (
-            "standard"
-            if data.costType == "standard"
-            else "bonus"
-            if data.costType == "bonus"
-            else "reaction"
-        )
-        if not getattr(attacker.turnActions, cost_attr):
-            return
-
-        if data.focusCost > attacker.focus.current:
+        if data.costType == "legendary":
+            leg_cost = max(1, data.legendaryCost or 1)
+            if attacker.legendaryActionsRemaining < leg_cost:
+                return
+            if data.focusCost > attacker.focus.current:
+                state.logs.append(f"{attacker.name} sem foco para {data.actionName}.")
+                return
+            attacker.legendaryActionsRemaining -= leg_cost
+        elif data.costType in ("standard", "bonus", "reaction"):
+            if not getattr(attacker.turnActions, data.costType):
+                return
+            if data.focusCost > attacker.focus.current:
+                state.logs.append(f"{attacker.name} sem foco para {data.actionName}.")
+                return
+            setattr(attacker.turnActions, data.costType, False)
+        elif data.focusCost > attacker.focus.current:
             state.logs.append(f"{attacker.name} sem foco para {data.actionName}.")
             return
 
-        # Consome ação e foco
-        setattr(attacker.turnActions, cost_attr, False)
         attacker.focus.current -= data.focusCost
 
         from app.managers.connection import manager
@@ -438,6 +444,7 @@ class PlayerService:
                     "log": final_log,
                     "attackerActions": attacker.turnActions.model_dump(),
                     "attackerFocus": attacker.focus.current,
+                    "attackerLegendaryRemaining": attacker.legendaryActionsRemaining,
                     "results": results,
                 },
             )
@@ -490,6 +497,7 @@ class PlayerService:
                 "log": final_log,
                 "attackerActions": attacker.turnActions.model_dump(),
                 "attackerFocus": attacker.focus.current,
+                "attackerLegendaryRemaining": attacker.legendaryActionsRemaining,
             },
         )
 
@@ -675,21 +683,18 @@ class PlayerService:
             ):
                 return
 
-            if data.costType != "none":
-                cost_attr = (
-                    "standard"
-                    if data.costType == "standard"
-                    else "bonus"
-                    if data.costType == "bonus"
-                    else "reaction"
+            if data.costType == "legendary":
+                leg_cost = max(1, data.legendaryCost or 1)
+                if attacker.legendaryActionsRemaining < leg_cost:
+                    return
+            elif data.costType in ("standard", "bonus", "reaction"):
+                if not getattr(attacker.turnActions, data.costType, True):
+                    return
+            if data.costType != "none" and data.focusCost > attacker.focus.current:
+                state.logs.append(
+                    f"{attacker.name} sem foco para {data.actionName}."
                 )
-                if not getattr(attacker.turnActions, cost_attr, True):
-                    return
-                if data.focusCost > attacker.focus.current:
-                    state.logs.append(
-                        f"{attacker.name} sem foco para {data.actionName}."
-                    )
-                    return
+                return
         else:
             # Se não estiver no dicionário de combatentes, permite GM / narrador / perigo ambiental
             if not (data.attackerId in ("gm", "GM_ADMIN") or data.attackerName):

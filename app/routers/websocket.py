@@ -44,12 +44,27 @@ async def authenticate_campaign(websocket: WebSocket, campaign_id: str):
     authorization = CampaignSocketAuthorization(
         store, token, campaign_id, member["role"], member["character_id"]
     )
+    room = f"campaign-{campaign_id}"
     await manager.connect(
-        f"campaign-{campaign_id}", websocket, already_accepted=True,
+        room, websocket, already_accepted=True,
         authorization=authorization,
     )
     await websocket.send_json({"type": "AUTH_OK", "role": member["role"]})
+    await _send_initial_snapshot(websocket, room)
     return identity, authorization
+
+
+async def _send_initial_snapshot(websocket: WebSocket, room: str) -> None:
+    """Entrega o estado atual do combate ao reconectar ou entrar com sessão ativa."""
+    get_state = getattr(manager, "get_state", None)
+    if not callable(get_state):
+        return
+    try:
+        state = await get_state(room)
+    except Exception:
+        return
+    if state is not None:
+        await websocket.send_json({"type": "STATE_SNAPSHOT", **state.model_dump()})
 
 
 async def receive_authorized_text(

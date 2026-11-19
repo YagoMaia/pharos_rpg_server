@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     MCP_PATH: str = "/mcp"
     MCP_ALLOWED_HOSTS: str = "pharos-server.yagomaia.com.br"
     MCP_ALLOWED_ORIGINS: str = ""
+    CORS_ORIGINS: str = "*"
 
     class Config:
         env_file = ".env"
@@ -20,6 +21,10 @@ class Settings(BaseSettings):
 
     def mcp_allowed_origins(self) -> list[str]:
         return _csv(self.MCP_ALLOWED_ORIGINS)
+
+    def cors_origins(self) -> list[str]:
+        origins = _csv(self.CORS_ORIGINS)
+        return origins or ["*"]
 
 
 def _csv(value: str) -> list[str]:

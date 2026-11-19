@@ -2,7 +2,7 @@ from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, model_validator
 
-ActionCostType = Literal["standard", "bonus", "reaction", "free", "none"]
+ActionCostType = Literal["standard", "bonus", "reaction", "legendary", "free", "none"]
 
 ConditionName = Literal[
     "Cego",
@@ -72,6 +72,7 @@ class ResolveActionPayload(BaseModel):
     # CUSTOS
     costType: ActionCostType = "standard"
     focusCost: int = 0  # 0 para ataques básicos, >0 para skills
+    legendaryCost: int = 1
 
     # EFEITOS single-target (Calculados no frontend)
     damageAmount: int = 0
@@ -96,6 +97,7 @@ class RequestSavingThrowPayload(BaseModel):
     targetIds: List[str]
     costType: ActionCostType = "none"
     focusCost: int = 0
+    legendaryCost: int = 1
     requestId: Optional[str] = None
     attackId: Optional[str] = None
 
