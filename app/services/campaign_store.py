@@ -103,6 +103,29 @@ class CampaignStore:
                     user_id TEXT NOT NULL REFERENCES users(id),
                     PRIMARY KEY (location_id, user_id)
                 );
+                CREATE TABLE IF NOT EXISTS campaign_tables (
+                    id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    title TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('roll', 'reference')),
+                    category TEXT NOT NULL DEFAULT 'Geral',
+                    dice_formula TEXT,
+                    description TEXT NOT NULL DEFAULT '',
+                    gm_notes TEXT NOT NULL DEFAULT '',
+                    columns_json TEXT NOT NULL DEFAULT '[]',
+                    rows_json TEXT NOT NULL DEFAULT '[]',
+                    location_id TEXT REFERENCES campaign_locations(id) ON DELETE SET NULL,
+                    visibility TEXT NOT NULL CHECK (visibility IN ('party', 'gm', 'selected')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_tables_campaign
+                    ON campaign_tables(campaign_id, category ASC, title ASC);
+                CREATE TABLE IF NOT EXISTS campaign_table_visibility (
+                    table_id TEXT NOT NULL REFERENCES campaign_tables(id) ON DELETE CASCADE,
+                    user_id TEXT NOT NULL REFERENCES users(id),
+                    PRIMARY KEY (table_id, user_id)
+                );
                 CREATE TABLE IF NOT EXISTS campaign_sessions (
                     id TEXT PRIMARY KEY,
                     campaign_id TEXT NOT NULL REFERENCES campaigns(id),
@@ -261,6 +284,7 @@ class CampaignStore:
                 "campaign_quests",
                 "campaign_encounters",
                 "campaign_npcs",
+                "campaign_tables",
             ):
                 cols = {
                     row["name"]
@@ -1360,6 +1384,258 @@ class CampaignStore:
                 conn, campaign_id, entry_id, user_id, note, is_gm=role == "gm"
             )
 
+    # --- CAMPAIGN TABLES ---
+    @staticmethod
+    def _save_table_visibility(
+        conn: sqlite3.Connection,
+        table_id: str,
+        member_ids: list[str],
+    ) -> None:
+        conn.execute(
+            "DELETE FROM campaign_table_visibility WHERE table_id = ?",
+            (table_id,),
+        )
+        for member_id in member_ids:
+            conn.execute(
+                "INSERT INTO campaign_table_visibility (table_id, user_id) VALUES (?, ?)",
+                (table_id, member_id),
+            )
+
+    @staticmethod
+    def _table_visible_map(
+        conn: sqlite3.Connection, table_ids: list[str]
+    ) -> dict[str, list[str]]:
+        if not table_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in table_ids)
+        rows = conn.execute(
+            f"SELECT table_id, user_id FROM campaign_table_visibility WHERE table_id IN ({placeholders}) ORDER BY user_id",
+            tuple(table_ids),
+        ).fetchall()
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            result.setdefault(row["table_id"], []).append(row["user_id"])
+        return result
+
+    @staticmethod
+    def _table(
+        row: sqlite3.Row,
+        is_gm: bool,
+        visible_to_member_ids: list[str] | None = None,
+        visible_location_ids: set[str] | None = None,
+    ) -> dict:
+        try:
+            columns = json.loads(row["columns_json"]) if row["columns_json"] else []
+        except (json.JSONDecodeError, TypeError):
+            columns = []
+        try:
+            rows = json.loads(row["rows_json"]) if row["rows_json"] else []
+        except (json.JSONDecodeError, TypeError):
+            rows = []
+        location_id = row["location_id"]
+        if (
+            not is_gm
+            and location_id
+            and visible_location_ids is not None
+            and location_id not in visible_location_ids
+        ):
+            location_id = None
+        data = {
+            "id": row["id"],
+            "campaignId": row["campaign_id"],
+            "title": row["title"],
+            "kind": row["kind"],
+            "category": row["category"],
+            "diceFormula": row["dice_formula"],
+            "description": row["description"],
+            "columns": columns,
+            "rows": rows,
+            "locationId": location_id,
+            "visibility": row["visibility"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+        if is_gm:
+            data["gmNotes"] = row["gm_notes"]
+            data["visibleToMemberIds"] = (
+                list(visible_to_member_ids or [])
+                if row["visibility"] == "selected"
+                else []
+            )
+        return data
+
+    def list_tables(self, user_id: str, campaign_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            role = self._member(conn, campaign_id, user_id)["role"]
+            is_gm = role == "gm"
+            if is_gm:
+                rows = conn.execute(
+                    """SELECT * FROM campaign_tables
+                    WHERE campaign_id = ?
+                    ORDER BY category ASC, title ASC, created_at DESC""",
+                    (campaign_id,),
+                ).fetchall()
+                vis_map = self._table_visible_map(conn, [row["id"] for row in rows])
+                return [
+                    self._table(row, True, vis_map.get(row["id"])) for row in rows
+                ]
+            rows = conn.execute(
+                """SELECT DISTINCT t.* FROM campaign_tables t
+                LEFT JOIN campaign_table_visibility v
+                  ON v.table_id = t.id AND v.user_id = ?
+                WHERE t.campaign_id = ?
+                  AND (t.visibility = 'party' OR (t.visibility = 'selected' AND v.user_id IS NOT NULL))
+                ORDER BY t.category ASC, t.title ASC, t.created_at DESC""",
+                (user_id, campaign_id),
+            ).fetchall()
+            visible_locs = self._visible_location_ids(conn, campaign_id, user_id)
+            return [
+                self._table(row, False, visible_location_ids=visible_locs)
+                for row in rows
+            ]
+
+    def create_table(
+        self,
+        user_id: str,
+        campaign_id: str,
+        title: str,
+        kind: str = "reference",
+        category: str = "Geral",
+        dice_formula: str | None = None,
+        description: str = "",
+        gm_notes: str = "",
+        columns: list[str] | None = None,
+        rows: list[dict] | None = None,
+        location_id: str | None = None,
+        visibility: str = "gm",
+        visible_to_member_ids: list[str] | None = None,
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode criar tabelas.")
+            target_ids = self._resolve_npc_targets(
+                conn, campaign_id, visibility, visible_to_member_ids
+            )
+            resolved_location = self._resolve_location_id(conn, campaign_id, location_id)
+            now = datetime.now(UTC).isoformat()
+            table_id = str(uuid4())
+            clean_formula = (
+                dice_formula.strip()
+                if isinstance(dice_formula, str) and dice_formula.strip()
+                else None
+            )
+            clean_cat = category.strip() or "Geral"
+            conn.execute(
+                """INSERT INTO campaign_tables (
+                    id, campaign_id, title, kind, category, dice_formula,
+                    description, gm_notes, columns_json, rows_json,
+                    location_id, visibility, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    table_id,
+                    campaign_id,
+                    title.strip(),
+                    kind,
+                    clean_cat,
+                    clean_formula,
+                    description.strip(),
+                    gm_notes.strip(),
+                    json.dumps(columns or [], ensure_ascii=False),
+                    json.dumps(rows or [], ensure_ascii=False),
+                    resolved_location,
+                    visibility,
+                    now,
+                    now,
+                ),
+            )
+            self._save_table_visibility(conn, table_id, target_ids)
+            row = conn.execute(
+                "SELECT * FROM campaign_tables WHERE id = ?", (table_id,)
+            ).fetchone()
+            return self._table(row, is_gm=True, visible_to_member_ids=target_ids)
+
+    def update_table(
+        self,
+        user_id: str,
+        campaign_id: str,
+        table_id: str,
+        title: str,
+        kind: str = "reference",
+        category: str = "Geral",
+        dice_formula: str | None = None,
+        description: str = "",
+        gm_notes: str = "",
+        columns: list[str] | None = None,
+        rows: list[dict] | None = None,
+        location_id: str | None = None,
+        visibility: str = "gm",
+        visible_to_member_ids: list[str] | None = None,
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode editar tabelas.")
+            existing = conn.execute(
+                "SELECT id FROM campaign_tables WHERE id = ? AND campaign_id = ?",
+                (table_id, campaign_id),
+            ).fetchone()
+            if not existing:
+                raise CampaignError(404, "Tabela não encontrada.")
+            target_ids = self._resolve_npc_targets(
+                conn, campaign_id, visibility, visible_to_member_ids
+            )
+            resolved_location = self._resolve_location_id(conn, campaign_id, location_id)
+            now = datetime.now(UTC).isoformat()
+            clean_formula = (
+                dice_formula.strip()
+                if isinstance(dice_formula, str) and dice_formula.strip()
+                else None
+            )
+            clean_cat = category.strip() or "Geral"
+            conn.execute(
+                """UPDATE campaign_tables
+                SET title = ?, kind = ?, category = ?, dice_formula = ?,
+                    description = ?, gm_notes = ?, columns_json = ?, rows_json = ?,
+                    location_id = ?, visibility = ?, updated_at = ?
+                WHERE id = ? AND campaign_id = ?""",
+                (
+                    title.strip(),
+                    kind,
+                    clean_cat,
+                    clean_formula,
+                    description.strip(),
+                    gm_notes.strip(),
+                    json.dumps(columns or [], ensure_ascii=False),
+                    json.dumps(rows or [], ensure_ascii=False),
+                    resolved_location,
+                    visibility,
+                    now,
+                    table_id,
+                    campaign_id,
+                ),
+            )
+            self._save_table_visibility(conn, table_id, target_ids)
+            row = conn.execute(
+                "SELECT * FROM campaign_tables WHERE id = ?", (table_id,)
+            ).fetchone()
+            return self._table(row, is_gm=True, visible_to_member_ids=target_ids)
+
+    def delete_table(
+        self, user_id: str, campaign_id: str, table_id: str
+    ) -> None:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode excluir tabelas.")
+            conn.execute(
+                "DELETE FROM campaign_table_visibility WHERE table_id = ?",
+                (table_id,),
+            )
+            deleted = conn.execute(
+                "DELETE FROM campaign_tables WHERE id = ? AND campaign_id = ?",
+                (table_id, campaign_id),
+            )
+            if deleted.rowcount == 0:
+                raise CampaignError(404, "Tabela não encontrada.")
+
     # --- LOCATIONS ---
     @staticmethod
     def _visible_location_ids(
@@ -1654,6 +1930,7 @@ class CampaignStore:
                 "campaign_quests",
                 "campaign_encounters",
                 "campaign_npcs",
+                "campaign_tables",
             ):
                 conn.execute(
                     f"UPDATE {table} SET location_id = NULL WHERE location_id = ? AND campaign_id = ?",
