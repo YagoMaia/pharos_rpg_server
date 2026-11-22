@@ -141,6 +141,29 @@ class LocationBody(BaseModel):
     visibleToMemberIds: list[str] = Field(default_factory=list, max_length=100)
 
 
+class TableRowBody(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    id: str = Field(min_length=1, max_length=64)
+    min: int | None = None
+    max: int | None = None
+    cells: list[str] = Field(default_factory=list, max_length=20)
+
+
+class CampaignTableBody(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    title: str = Field(min_length=1, max_length=160)
+    kind: Literal["roll", "reference"] = "reference"
+    category: str = Field(default="Geral", max_length=80)
+    diceFormula: str | None = Field(default=None, max_length=32)
+    description: str = Field(default="", max_length=20000)
+    gmNotes: str = Field(default="", max_length=20000)
+    columns: list[str] = Field(default_factory=list, max_length=20)
+    rows: list[TableRowBody] = Field(default_factory=list, max_length=500)
+    locationId: str | None = Field(default=None, max_length=64)
+    visibility: Literal["party", "gm", "selected"] = "gm"
+    visibleToMemberIds: list[str] = Field(default_factory=list, max_length=100)
+
+
 class NpcTemplateBody(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     id: str | None = None
@@ -649,6 +672,59 @@ def update_location(
 @router.delete("/campaigns/{campaign_id}/locations/{location_id}", status_code=204)
 def delete_location(campaign_id: str, location_id: str, user: User, store: Store):
     store.delete_location(user["id"], campaign_id, location_id)
+    return Response(status_code=204)
+
+
+# --- CAMPAIGN TABLES (TABELAS DE ROLAGEM E REFERÊNCIA) ---
+@router.get("/campaigns/{campaign_id}/tables")
+def list_tables(campaign_id: str, user: User, store: Store):
+    return store.list_tables(user["id"], campaign_id)
+
+
+@router.post("/campaigns/{campaign_id}/tables", status_code=201)
+def create_table(campaign_id: str, body: CampaignTableBody, user: User, store: Store):
+    return store.create_table(
+        user["id"],
+        campaign_id,
+        body.title,
+        body.kind,
+        body.category,
+        body.diceFormula,
+        body.description,
+        body.gmNotes,
+        body.columns,
+        [row.model_dump() for row in body.rows],
+        body.locationId,
+        body.visibility,
+        body.visibleToMemberIds,
+    )
+
+
+@router.put("/campaigns/{campaign_id}/tables/{table_id}")
+def update_table(
+    campaign_id: str, table_id: str, body: CampaignTableBody, user: User, store: Store
+):
+    return store.update_table(
+        user["id"],
+        campaign_id,
+        table_id,
+        body.title,
+        body.kind,
+        body.category,
+        body.diceFormula,
+        body.description,
+        body.gmNotes,
+        body.columns,
+        [row.model_dump() for row in body.rows],
+        body.locationId,
+        body.visibility,
+        body.visibleToMemberIds,
+    )
+
+
+@router.delete("/campaigns/{campaign_id}/tables/{table_id}", status_code=204)
+def delete_table(campaign_id: str, table_id: str, user: User, store: Store):
+    store.delete_table(user["id"], campaign_id, table_id)
     return Response(status_code=204)
 
 
