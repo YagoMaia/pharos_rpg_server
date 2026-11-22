@@ -83,6 +83,26 @@ class CampaignStore:
                 );
                 CREATE INDEX IF NOT EXISTS journal_campaign_recent
                     ON journal_entries(campaign_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS campaign_locations (
+                    id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+                    parent_id TEXT REFERENCES campaign_locations(id) ON DELETE SET NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('region', 'location')),
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    gm_notes TEXT NOT NULL DEFAULT '',
+                    image TEXT,
+                    visibility TEXT NOT NULL CHECK (visibility IN ('party', 'gm', 'selected')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_locations_campaign
+                    ON campaign_locations(campaign_id, kind, name ASC);
+                CREATE TABLE IF NOT EXISTS campaign_location_visibility (
+                    location_id TEXT NOT NULL REFERENCES campaign_locations(id) ON DELETE CASCADE,
+                    user_id TEXT NOT NULL REFERENCES users(id),
+                    PRIMARY KEY (location_id, user_id)
+                );
                 CREATE TABLE IF NOT EXISTS campaign_sessions (
                     id TEXT PRIMARY KEY,
                     campaign_id TEXT NOT NULL REFERENCES campaigns(id),
@@ -91,6 +111,7 @@ class CampaignStore:
                     summary TEXT NOT NULL DEFAULT '',
                     scheduled_at TEXT,
                     status TEXT NOT NULL CHECK (status IN ('planned', 'active', 'completed')),
+                    location_id TEXT REFERENCES campaign_locations(id) ON DELETE SET NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -187,6 +208,7 @@ class CampaignStore:
             if "character_data" not in cols:
                 conn.execute("ALTER TABLE members ADD COLUMN character_data TEXT")
         self._migrate_npc_visibility()
+        self._migrate_locations()
 
     def _migrate_npc_visibility(self) -> None:
         with closing(sqlite3.connect(self.path, timeout=5)) as conn:
@@ -231,6 +253,23 @@ class CampaignStore:
                     CREATE INDEX IF NOT EXISTS idx_npc_visibility_user
                         ON campaign_npc_visibility(user_id, npc_id);
                 """)
+
+    def _migrate_locations(self) -> None:
+        with closing(self._connect()) as conn, conn:
+            for table in (
+                "campaign_sessions",
+                "campaign_quests",
+                "campaign_encounters",
+                "campaign_npcs",
+            ):
+                cols = {
+                    row["name"]
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if cols and "location_id" not in cols:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN location_id TEXT REFERENCES campaign_locations(id) ON DELETE SET NULL"
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         return open_connection(self.path)
@@ -621,7 +660,19 @@ class CampaignStore:
                 raise CampaignError(404, "Nota não encontrada.")
 
     @staticmethod
-    def _session(row: sqlite3.Row) -> dict:
+    def _session(
+        row: sqlite3.Row,
+        is_gm: bool = True,
+        visible_location_ids: set[str] | None = None,
+    ) -> dict:
+        location_id = dict(row).get("location_id")
+        if (
+            not is_gm
+            and location_id
+            and visible_location_ids is not None
+            and location_id not in visible_location_ids
+        ):
+            location_id = None
         return {
             "id": row["id"],
             "campaignId": row["campaign_id"],
@@ -630,20 +681,28 @@ class CampaignStore:
             "summary": row["summary"],
             "scheduledAt": row["scheduled_at"],
             "status": row["status"],
+            "locationId": location_id,
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
 
     def list_sessions(self, user_id: str, campaign_id: str) -> list[dict]:
         with closing(self._connect()) as conn:
-            self._member(conn, campaign_id, user_id)
+            role = self._member(conn, campaign_id, user_id)["role"]
+            is_gm = role == "gm"
             rows = conn.execute(
                 """SELECT * FROM campaign_sessions
                 WHERE campaign_id = ?
                 ORDER BY session_number ASC, created_at ASC""",
                 (campaign_id,),
             ).fetchall()
-            return [self._session(row) for row in rows]
+            visible_locs = (
+                None if is_gm else self._visible_location_ids(conn, campaign_id, user_id)
+            )
+            return [
+                self._session(row, is_gm=is_gm, visible_location_ids=visible_locs)
+                for row in rows
+            ]
 
     def create_session(
         self,
@@ -654,10 +713,12 @@ class CampaignStore:
         summary: str = "",
         scheduled_at: str | None = None,
         status: str = "planned",
+        location_id: str | None = None,
     ) -> dict:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode gerenciar sessões.")
+            resolved_location = self._resolve_location_id(conn, campaign_id, location_id)
             row = records.insert_session(
                 conn,
                 campaign_id,
@@ -668,6 +729,9 @@ class CampaignStore:
                     "scheduled_at": scheduled_at,
                     "status": status,
                 },
+            )
+            row = self._set_record_location(
+                conn, "campaign_sessions", campaign_id, row["id"], resolved_location
             )
             return self._session(row)
 
@@ -681,10 +745,12 @@ class CampaignStore:
         summary: str = "",
         scheduled_at: str | None = None,
         status: str = "planned",
+        location_id: str | None = None,
     ) -> dict:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode editar sessões.")
+            resolved_location = self._resolve_location_id(conn, campaign_id, location_id)
             row = records.update_session(
                 conn,
                 campaign_id,
@@ -696,6 +762,9 @@ class CampaignStore:
                     "scheduled_at": scheduled_at,
                     "status": status,
                 },
+            )
+            row = self._set_record_location(
+                conn, "campaign_sessions", campaign_id, row["id"], resolved_location
             )
             return self._session(row)
 
@@ -711,7 +780,19 @@ class CampaignStore:
                 raise CampaignError(404, "Sessão não encontrada.")
 
     @staticmethod
-    def _quest(row: sqlite3.Row) -> dict:
+    def _quest(
+        row: sqlite3.Row,
+        is_gm: bool = True,
+        visible_location_ids: set[str] | None = None,
+    ) -> dict:
+        location_id = dict(row).get("location_id")
+        if (
+            not is_gm
+            and location_id
+            and visible_location_ids is not None
+            and location_id not in visible_location_ids
+        ):
+            location_id = None
         return {
             "id": row["id"],
             "campaignId": row["campaign_id"],
@@ -720,6 +801,7 @@ class CampaignStore:
             "reward": row["reward"],
             "status": row["status"],
             "visibility": row["visibility"],
+            "locationId": location_id,
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -727,13 +809,20 @@ class CampaignStore:
     def list_quests(self, user_id: str, campaign_id: str) -> list[dict]:
         with closing(self._connect()) as conn:
             role = self._member(conn, campaign_id, user_id)["role"]
+            is_gm = role == "gm"
             rows = conn.execute(
                 """SELECT * FROM campaign_quests
                 WHERE campaign_id = ? AND (visibility = 'party' OR ? = 'gm')
                 ORDER BY created_at DESC, id DESC""",
                 (campaign_id, role),
             ).fetchall()
-            return [self._quest(row) for row in rows]
+            visible_locs = (
+                None if is_gm else self._visible_location_ids(conn, campaign_id, user_id)
+            )
+            return [
+                self._quest(row, is_gm=is_gm, visible_location_ids=visible_locs)
+                for row in rows
+            ]
 
     def create_quest(
         self,
@@ -744,10 +833,12 @@ class CampaignStore:
         reward: str = "",
         visibility: str = "party",
         status: str = "active",
+        location_id: str | None = None,
     ) -> dict:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode gerenciar missões.")
+            resolved_location = self._resolve_location_id(conn, campaign_id, location_id)
             row = records.insert_quest(
                 conn,
                 campaign_id,
@@ -758,6 +849,9 @@ class CampaignStore:
                     "status": status,
                     "visibility": visibility,
                 },
+            )
+            row = self._set_record_location(
+                conn, "campaign_quests", campaign_id, row["id"], resolved_location
             )
             return self._quest(row)
 
@@ -771,10 +865,12 @@ class CampaignStore:
         reward: str = "",
         visibility: str = "party",
         status: str = "active",
+        location_id: str | None = None,
     ) -> dict:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode editar missões.")
+            resolved_location = self._resolve_location_id(conn, campaign_id, location_id)
             row = records.update_quest(
                 conn,
                 campaign_id,
@@ -786,6 +882,9 @@ class CampaignStore:
                     "visibility": visibility,
                     "status": status,
                 },
+            )
+            row = self._set_record_location(
+                conn, "campaign_quests", campaign_id, row["id"], resolved_location
             )
             return self._quest(row)
 
@@ -818,6 +917,7 @@ class CampaignStore:
             "rewards": row["rewards"],
             "status": row["status"],
             "monstersData": monsters,
+            "locationId": dict(row).get("location_id"),
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -856,10 +956,12 @@ class CampaignStore:
         rewards: str = "",
         status: str = "planned",
         monsters_data: list | None = None,
+        location_id: str | None = None,
     ) -> dict:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode criar encontros.")
+            resolved_location = self._resolve_location_id(conn, campaign_id, location_id)
             row = records.insert_encounter(
                 conn,
                 campaign_id,
@@ -871,6 +973,9 @@ class CampaignStore:
                     "status": status,
                     "monsters_data": monsters_data,
                 },
+            )
+            row = self._set_record_location(
+                conn, "campaign_encounters", campaign_id, row["id"], resolved_location
             )
             return self._encounter(row)
 
@@ -885,10 +990,12 @@ class CampaignStore:
         rewards: str = "",
         status: str = "planned",
         monsters_data: list | None = None,
+        location_id: str | None = None,
     ) -> dict:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
                 raise CampaignError(403, "Apenas o mestre pode editar encontros.")
+            resolved_location = self._resolve_location_id(conn, campaign_id, location_id)
             row = records.update_encounter(
                 conn,
                 campaign_id,
@@ -901,6 +1008,9 @@ class CampaignStore:
                     "status": status,
                     "monsters_data": monsters_data,
                 },
+            )
+            row = self._set_record_location(
+                conn, "campaign_encounters", campaign_id, row["id"], resolved_location
             )
             return self._encounter(row)
 
@@ -921,6 +1031,7 @@ class CampaignStore:
         row: sqlite3.Row,
         is_gm: bool,
         visible_to_member_ids: list[str] | None = None,
+        visible_location_ids: set[str] | None = None,
     ) -> dict:
         combat = None
         if row["combat_data"]:
@@ -928,6 +1039,9 @@ class CampaignStore:
                 combat = json.loads(row["combat_data"])
             except (json.JSONDecodeError, TypeError):
                 combat = None
+        location_id = dict(row).get("location_id")
+        if not is_gm and location_id and visible_location_ids is not None and location_id not in visible_location_ids:
+            location_id = None
         data = {
             "id": row["id"],
             "campaignId": row["campaign_id"],
@@ -937,6 +1051,7 @@ class CampaignStore:
             "description": row["description"],
             "combatData": combat,
             "visibility": row["visibility"],
+            "locationId": location_id,
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -1034,7 +1149,11 @@ class CampaignStore:
                 ORDER BY n.created_at DESC, n.id DESC""",
                 (user_id, campaign_id),
             ).fetchall()
-            return [self._npc(row, False) for row in rows]
+            visible_locs = self._visible_location_ids(conn, campaign_id, user_id)
+            return [
+                self._npc(row, False, visible_location_ids=visible_locs)
+                for row in rows
+            ]
 
     def create_npc(
         self,
@@ -1048,6 +1167,7 @@ class CampaignStore:
         combat_data: dict | None = None,
         visibility: str = "party",
         visible_to_member_ids: list[str] | None = None,
+        location_id: str | None = None,
     ) -> dict:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
@@ -1055,6 +1175,7 @@ class CampaignStore:
             target_ids = self._resolve_npc_targets(
                 conn, campaign_id, visibility, visible_to_member_ids
             )
+            resolved_location = self._resolve_location_id(conn, campaign_id, location_id)
             row = records.insert_npc(
                 conn,
                 campaign_id,
@@ -1067,6 +1188,9 @@ class CampaignStore:
                     "combat_data": combat_data,
                     "visibility": visibility,
                 },
+            )
+            row = self._set_record_location(
+                conn, "campaign_npcs", campaign_id, row["id"], resolved_location
             )
             self._save_npc_visibility(conn, row["id"], target_ids)
             return self._npc(row, is_gm=True, visible_to_member_ids=target_ids)
@@ -1084,6 +1208,7 @@ class CampaignStore:
         combat_data: dict | None = None,
         visibility: str = "party",
         visible_to_member_ids: list[str] | None = None,
+        location_id: str | None = None,
     ) -> dict:
         with closing(self._connect()) as conn, conn:
             if self._member(conn, campaign_id, user_id)["role"] != "gm":
@@ -1091,6 +1216,7 @@ class CampaignStore:
             target_ids = self._resolve_npc_targets(
                 conn, campaign_id, visibility, visible_to_member_ids
             )
+            resolved_location = self._resolve_location_id(conn, campaign_id, location_id)
             row = records.update_npc(
                 conn,
                 campaign_id,
@@ -1104,6 +1230,9 @@ class CampaignStore:
                     "combat_data": combat_data,
                     "visibility": visibility,
                 },
+            )
+            row = self._set_record_location(
+                conn, "campaign_npcs", campaign_id, row["id"], resolved_location
             )
             self._save_npc_visibility(conn, npc_id, target_ids)
             return self._npc(row, is_gm=True, visible_to_member_ids=target_ids)
@@ -1230,6 +1359,320 @@ class CampaignStore:
             return compendium_records.save_compendium_note(
                 conn, campaign_id, entry_id, user_id, note, is_gm=role == "gm"
             )
+
+    # --- LOCATIONS ---
+    @staticmethod
+    def _visible_location_ids(
+        conn: sqlite3.Connection, campaign_id: str, user_id: str
+    ) -> set[str]:
+        rows = conn.execute(
+            """SELECT DISTINCT l.id FROM campaign_locations l
+            LEFT JOIN campaign_location_visibility v
+              ON v.location_id = l.id AND v.user_id = ?
+            WHERE l.campaign_id = ?
+              AND (l.visibility = 'party' OR (l.visibility = 'selected' AND v.user_id IS NOT NULL))""",
+            (user_id, campaign_id),
+        ).fetchall()
+        return {row["id"] for row in rows}
+
+    @staticmethod
+    def _resolve_location_id(
+        conn: sqlite3.Connection, campaign_id: str, location_id: str | None
+    ) -> str | None:
+        if location_id is None:
+            return None
+        clean = location_id.strip()
+        if not clean:
+            return None
+        row = conn.execute(
+            "SELECT 1 FROM campaign_locations WHERE id = ? AND campaign_id = ?",
+            (clean, campaign_id),
+        ).fetchone()
+        if not row:
+            raise CampaignError(422, "Localidade não encontrada nesta campanha.")
+        return clean
+
+    @staticmethod
+    def _resolve_parent_location_id(
+        conn: sqlite3.Connection,
+        campaign_id: str,
+        parent_id: str | None,
+        self_id: str | None = None,
+    ) -> str | None:
+        if parent_id is None:
+            return None
+        clean = parent_id.strip()
+        if not clean:
+            return None
+        if self_id and clean == self_id:
+            raise CampaignError(422, "Uma localidade não pode ser pai de si mesma.")
+        row = conn.execute(
+            "SELECT id, kind FROM campaign_locations WHERE id = ? AND campaign_id = ?",
+            (clean, campaign_id),
+        ).fetchone()
+        if not row:
+            raise CampaignError(422, "Região pai não encontrada nesta campanha.")
+        if row["kind"] != "region":
+            raise CampaignError(422, "Apenas regiões podem ser definidas como pai.")
+        return clean
+
+    @staticmethod
+    def _set_record_location(
+        conn: sqlite3.Connection,
+        table: str,
+        campaign_id: str,
+        record_id: str,
+        location_id: str | None,
+    ) -> sqlite3.Row:
+        if table not in {
+            "campaign_sessions",
+            "campaign_quests",
+            "campaign_encounters",
+            "campaign_npcs",
+        }:
+            raise ValueError(f"Tabela inválida para location_id: {table}")
+        conn.execute(
+            f"UPDATE {table} SET location_id = ? WHERE id = ? AND campaign_id = ?",
+            (location_id, record_id, campaign_id),
+        )
+        return conn.execute(
+            f"SELECT * FROM {table} WHERE id = ? AND campaign_id = ?",
+            (record_id, campaign_id),
+        ).fetchone()
+
+    @staticmethod
+    def _save_location_visibility(
+        conn: sqlite3.Connection,
+        location_id: str,
+        member_ids: list[str],
+    ) -> None:
+        conn.execute(
+            "DELETE FROM campaign_location_visibility WHERE location_id = ?",
+            (location_id,),
+        )
+        for member_id in member_ids:
+            conn.execute(
+                "INSERT INTO campaign_location_visibility (location_id, user_id) VALUES (?, ?)",
+                (location_id, member_id),
+            )
+
+    @staticmethod
+    def _location_visible_map(
+        conn: sqlite3.Connection, location_ids: list[str]
+    ) -> dict[str, list[str]]:
+        if not location_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in location_ids)
+        rows = conn.execute(
+            f"SELECT location_id, user_id FROM campaign_location_visibility WHERE location_id IN ({placeholders}) ORDER BY user_id",
+            tuple(location_ids),
+        ).fetchall()
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            result.setdefault(row["location_id"], []).append(row["user_id"])
+        return result
+
+    @staticmethod
+    def _location(
+        row: sqlite3.Row,
+        is_gm: bool,
+        visible_to_member_ids: list[str] | None = None,
+        visible_parent_ids: set[str] | None = None,
+    ) -> dict:
+        parent_id = row["parent_id"]
+        if (
+            not is_gm
+            and parent_id
+            and visible_parent_ids is not None
+            and parent_id not in visible_parent_ids
+        ):
+            parent_id = None
+        data = {
+            "id": row["id"],
+            "campaignId": row["campaign_id"],
+            "parentId": parent_id,
+            "kind": row["kind"],
+            "name": row["name"],
+            "description": row["description"],
+            "image": row["image"],
+            "visibility": row["visibility"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+        if is_gm:
+            data["gmNotes"] = row["gm_notes"]
+            data["visibleToMemberIds"] = (
+                list(visible_to_member_ids or [])
+                if row["visibility"] == "selected"
+                else []
+            )
+        return data
+
+    def list_locations(self, user_id: str, campaign_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            role = self._member(conn, campaign_id, user_id)["role"]
+            is_gm = role == "gm"
+            if is_gm:
+                rows = conn.execute(
+                    """SELECT * FROM campaign_locations
+                    WHERE campaign_id = ?
+                    ORDER BY CASE WHEN kind = 'region' THEN 0 ELSE 1 END, name ASC, created_at DESC""",
+                    (campaign_id,),
+                ).fetchall()
+                vis_map = self._location_visible_map(conn, [row["id"] for row in rows])
+                return [
+                    self._location(row, True, vis_map.get(row["id"])) for row in rows
+                ]
+            rows = conn.execute(
+                """SELECT DISTINCT l.* FROM campaign_locations l
+                LEFT JOIN campaign_location_visibility v
+                  ON v.location_id = l.id AND v.user_id = ?
+                WHERE l.campaign_id = ?
+                  AND (l.visibility = 'party' OR (l.visibility = 'selected' AND v.user_id IS NOT NULL))
+                ORDER BY CASE WHEN l.kind = 'region' THEN 0 ELSE 1 END, l.name ASC, l.created_at DESC""",
+                (user_id, campaign_id),
+            ).fetchall()
+            visible_ids = {row["id"] for row in rows}
+            return [
+                self._location(row, False, visible_parent_ids=visible_ids)
+                for row in rows
+            ]
+
+    def create_location(
+        self,
+        user_id: str,
+        campaign_id: str,
+        name: str,
+        kind: str = "region",
+        parent_id: str | None = None,
+        description: str = "",
+        gm_notes: str = "",
+        image: str | None = None,
+        visibility: str = "gm",
+        visible_to_member_ids: list[str] | None = None,
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode criar localidades.")
+            target_ids = self._resolve_npc_targets(
+                conn, campaign_id, visibility, visible_to_member_ids
+            )
+            resolved_parent = self._resolve_parent_location_id(
+                conn, campaign_id, parent_id
+            )
+            now = datetime.now(UTC).isoformat()
+            location_id = str(uuid4())
+            clean_image = image.strip() if isinstance(image, str) and image.strip() else None
+            conn.execute(
+                """INSERT INTO campaign_locations (
+                    id, campaign_id, parent_id, kind, name, description,
+                    gm_notes, image, visibility, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    location_id,
+                    campaign_id,
+                    resolved_parent,
+                    kind,
+                    name.strip(),
+                    description.strip(),
+                    gm_notes.strip(),
+                    clean_image,
+                    visibility,
+                    now,
+                    now,
+                ),
+            )
+            self._save_location_visibility(conn, location_id, target_ids)
+            row = conn.execute(
+                "SELECT * FROM campaign_locations WHERE id = ?", (location_id,)
+            ).fetchone()
+            return self._location(row, is_gm=True, visible_to_member_ids=target_ids)
+
+    def update_location(
+        self,
+        user_id: str,
+        campaign_id: str,
+        location_id: str,
+        name: str,
+        kind: str = "region",
+        parent_id: str | None = None,
+        description: str = "",
+        gm_notes: str = "",
+        image: str | None = None,
+        visibility: str = "gm",
+        visible_to_member_ids: list[str] | None = None,
+    ) -> dict:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode editar localidades.")
+            existing = conn.execute(
+                "SELECT id FROM campaign_locations WHERE id = ? AND campaign_id = ?",
+                (location_id, campaign_id),
+            ).fetchone()
+            if not existing:
+                raise CampaignError(404, "Localidade não encontrada.")
+            target_ids = self._resolve_npc_targets(
+                conn, campaign_id, visibility, visible_to_member_ids
+            )
+            resolved_parent = self._resolve_parent_location_id(
+                conn, campaign_id, parent_id, self_id=location_id
+            )
+            now = datetime.now(UTC).isoformat()
+            clean_image = image.strip() if isinstance(image, str) and image.strip() else None
+            conn.execute(
+                """UPDATE campaign_locations
+                SET parent_id = ?, kind = ?, name = ?, description = ?,
+                    gm_notes = ?, image = ?, visibility = ?, updated_at = ?
+                WHERE id = ? AND campaign_id = ?""",
+                (
+                    resolved_parent,
+                    kind,
+                    name.strip(),
+                    description.strip(),
+                    gm_notes.strip(),
+                    clean_image,
+                    visibility,
+                    now,
+                    location_id,
+                    campaign_id,
+                ),
+            )
+            self._save_location_visibility(conn, location_id, target_ids)
+            row = conn.execute(
+                "SELECT * FROM campaign_locations WHERE id = ?", (location_id,)
+            ).fetchone()
+            return self._location(row, is_gm=True, visible_to_member_ids=target_ids)
+
+    def delete_location(
+        self, user_id: str, campaign_id: str, location_id: str
+    ) -> None:
+        with closing(self._connect()) as conn, conn:
+            if self._member(conn, campaign_id, user_id)["role"] != "gm":
+                raise CampaignError(403, "Apenas o mestre pode excluir localidades.")
+            for table in (
+                "campaign_sessions",
+                "campaign_quests",
+                "campaign_encounters",
+                "campaign_npcs",
+            ):
+                conn.execute(
+                    f"UPDATE {table} SET location_id = NULL WHERE location_id = ? AND campaign_id = ?",
+                    (location_id, campaign_id),
+                )
+            conn.execute(
+                "UPDATE campaign_locations SET parent_id = NULL WHERE parent_id = ? AND campaign_id = ?",
+                (location_id, campaign_id),
+            )
+            conn.execute(
+                "DELETE FROM campaign_location_visibility WHERE location_id = ?",
+                (location_id,),
+            )
+            deleted = conn.execute(
+                "DELETE FROM campaign_locations WHERE id = ? AND campaign_id = ?",
+                (location_id, campaign_id),
+            )
+            if deleted.rowcount == 0:
+                raise CampaignError(404, "Localidade não encontrada.")
 
     def create_npc_template(
         self,
@@ -1378,5 +1821,4 @@ class CampaignStore:
             return compendium_records.save_compendium_note(
                 conn, campaign_id, entry_id, user_id, note, is_gm=role == "gm"
             )
-
 

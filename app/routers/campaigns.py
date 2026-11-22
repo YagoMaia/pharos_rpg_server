@@ -85,6 +85,7 @@ class SessionBody(BaseModel):
     summary: str = Field(default="", max_length=20000)
     scheduledAt: str | None = Field(default=None, max_length=64)
     status: Literal["planned", "active", "completed"] = "planned"
+    locationId: str | None = Field(default=None, max_length=64)
 
 
 class QuestBody(BaseModel):
@@ -94,6 +95,7 @@ class QuestBody(BaseModel):
     reward: str = Field(default="", max_length=1000)
     visibility: Literal["party", "gm"] = "party"
     status: Literal["active", "completed", "failed"] = "active"
+    locationId: str | None = Field(default=None, max_length=64)
 
 
 class JournalEntryBody(BaseModel):
@@ -111,6 +113,7 @@ class EncounterBody(BaseModel):
     rewards: str = Field(default="", max_length=1000)
     status: Literal["planned", "ready", "completed"] = "planned"
     monstersData: list[dict] = Field(default_factory=list)
+    locationId: str | None = Field(default=None, max_length=64)
 
 
 class NpcBody(BaseModel):
@@ -122,6 +125,19 @@ class NpcBody(BaseModel):
     gmNotes: str = Field(default="", max_length=20000)
     combatData: dict | None = None
     visibility: Literal["party", "gm", "selected"] = "party"
+    visibleToMemberIds: list[str] = Field(default_factory=list, max_length=100)
+    locationId: str | None = Field(default=None, max_length=64)
+
+
+class LocationBody(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=120)
+    kind: Literal["region", "location"] = "region"
+    parentId: str | None = Field(default=None, max_length=64)
+    description: str = Field(default="", max_length=20000)
+    gmNotes: str = Field(default="", max_length=20000)
+    image: str | None = Field(default=None, max_length=2_000_000)
+    visibility: Literal["party", "gm", "selected"] = "gm"
     visibleToMemberIds: list[str] = Field(default_factory=list, max_length=100)
 
 
@@ -263,6 +279,7 @@ def create_session(
         body.summary,
         body.scheduledAt,
         body.status,
+        location_id=body.locationId,
     )
 
 
@@ -283,6 +300,7 @@ def update_session(
         body.summary,
         body.scheduledAt,
         body.status,
+        location_id=body.locationId,
     )
 
 
@@ -309,6 +327,7 @@ def create_quest(campaign_id: str, body: QuestBody, user: User, store: Store):
         body.reward,
         body.visibility,
         body.status,
+        location_id=body.locationId,
     )
 
 
@@ -325,6 +344,7 @@ def update_quest(
         body.reward,
         body.visibility,
         body.status,
+        location_id=body.locationId,
     )
 
 
@@ -378,6 +398,7 @@ def create_encounter(campaign_id: str, body: EncounterBody, user: User, store: S
         body.rewards,
         body.status,
         body.monstersData,
+        location_id=body.locationId,
     )
 
 
@@ -395,6 +416,7 @@ def update_encounter(
         body.rewards,
         body.status,
         body.monstersData,
+        location_id=body.locationId,
     )
 
 
@@ -514,6 +536,7 @@ async def launch_encounter(
         encounter["rewards"],
         "ready",
         monsters_data,
+        location_id=encounter.get("locationId"),
     )
 
     await manager.broadcast_state(session_id, state)
@@ -554,6 +577,7 @@ def create_npc(campaign_id: str, body: NpcBody, user: User, store: Store):
         body.combatData,
         body.visibility,
         body.visibleToMemberIds,
+        location_id=body.locationId,
     )
 
 
@@ -571,12 +595,60 @@ def update_npc(campaign_id: str, npc_id: str, body: NpcBody, user: User, store: 
         body.combatData,
         body.visibility,
         body.visibleToMemberIds,
+        location_id=body.locationId,
     )
 
 
 @router.delete("/campaigns/{campaign_id}/npcs/{npc_id}", status_code=204)
 def delete_npc(campaign_id: str, npc_id: str, user: User, store: Store):
     store.delete_npc(user["id"], campaign_id, npc_id)
+    return Response(status_code=204)
+
+
+# --- LOCATIONS (REGIÕES E LOCALIDADES) ---
+@router.get("/campaigns/{campaign_id}/locations")
+def list_locations(campaign_id: str, user: User, store: Store):
+    return store.list_locations(user["id"], campaign_id)
+
+
+@router.post("/campaigns/{campaign_id}/locations", status_code=201)
+def create_location(campaign_id: str, body: LocationBody, user: User, store: Store):
+    return store.create_location(
+        user["id"],
+        campaign_id,
+        body.name,
+        body.kind,
+        body.parentId,
+        body.description,
+        body.gmNotes,
+        body.image,
+        body.visibility,
+        body.visibleToMemberIds,
+    )
+
+
+@router.put("/campaigns/{campaign_id}/locations/{location_id}")
+def update_location(
+    campaign_id: str, location_id: str, body: LocationBody, user: User, store: Store
+):
+    return store.update_location(
+        user["id"],
+        campaign_id,
+        location_id,
+        body.name,
+        body.kind,
+        body.parentId,
+        body.description,
+        body.gmNotes,
+        body.image,
+        body.visibility,
+        body.visibleToMemberIds,
+    )
+
+
+@router.delete("/campaigns/{campaign_id}/locations/{location_id}", status_code=204)
+def delete_location(campaign_id: str, location_id: str, user: User, store: Store):
+    store.delete_location(user["id"], campaign_id, location_id)
     return Response(status_code=204)
 
 
