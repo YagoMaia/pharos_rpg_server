@@ -36,6 +36,7 @@ TABLE_NAMES = (
     "Amom",
     "Victor",
     "Wayne",
+    "Estevão",
     "Visitante",
 )
 
@@ -283,7 +284,9 @@ class CampaignStore:
             (entry for entry in TABLE_NAMES if entry.lower() == name.strip().lower()),
             None,
         )
-        if not canonical or not secrets.compare_digest(pin, canonical.lower()):
+        if not canonical or not secrets.compare_digest(
+            pin.encode("utf-8"), canonical.lower().encode("utf-8")
+        ):
             raise CampaignError(401, "Nome ou PIN inválidos.")
         with closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")

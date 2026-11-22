@@ -244,6 +244,7 @@ class CampaignApiTests(unittest.TestCase):
             "Amom",
             "Victor",
             "Wayne",
+            "Estevão",
             "Visitante",
         )
         for name in roster:
